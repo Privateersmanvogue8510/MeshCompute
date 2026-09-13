@@ -86,8 +86,9 @@ async def main() -> None:
               for _ in range(gpus)],
         ram_free_bytes=64_000_000_000,
         benchmark=BenchmarkResult(decode_tokens_per_sec=decode_tps,
-                                  measured_model=model, measured_at="live"),
-        advertised_addr=backend_url)
+                                  measured_model=model, measured_at="live"))
+    # node_id -> backend_url mapping is carried in deploy/nodes.local.yaml (written
+    # below), which is how the gateway resolves the worker endpoint.
     signed = SignedCapability(record=rec, public_b64=ident.public_b64,
                               signature_b64=ident.sign_json(rec.model_dump(mode="json")))
 
