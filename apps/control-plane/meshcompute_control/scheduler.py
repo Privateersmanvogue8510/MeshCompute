@@ -150,12 +150,13 @@ class Scheduler:
         return ttft, decode_tps, trace
 
     def _score(self, ttft: float, decode_tps: float, nodes: list[CapabilityRecord],
-               graph: TopologyGraph, chain: list[str]) -> float:
-        """Lower is better. Total time to produce a representative response +
-        reliability penalty. Objective = user-visible latency."""
+               graph: TopologyGraph, chain: list[str], queue_wait_s: float = 0.0) -> float:
+        """Lower is better. Total user-visible time = queue wait + ttft + generation +
+        reliability penalty. queue_wait_s is how long this request would sit behind
+        others already on the chosen node — this is what makes adding nodes help:
+        more replicas -> a free/closer node exists -> less queue wait for you."""
         REPRESENTATIVE_GEN = 256
-        total = ttft + (REPRESENTATIVE_GEN / decode_tps if decode_tps > 0 else 1e9)
-        # reliability: expected restart probability from worst link stability + node.
+        total = queue_wait_s + ttft + (REPRESENTATIVE_GEN / decode_tps if decode_tps > 0 else 1e9)
         worst = self._worst_link(graph, chain)
         p_fail = 1.0 - worst.stability
         total += p_fail * self.cost.reliability_penalty_s
@@ -165,11 +166,19 @@ class Scheduler:
     def plan(self, *, model: ModelManifest, nodes: dict[str, CapabilityRecord],
              graph: TopologyGraph, client_node_id: str, context_length: int,
              prompt_tokens: int = 512, gen_tokens: int = 256,
+             load: dict[str, int] | None = None,
              plan_id: str = "plan_0") -> ExecutionPlan:
         """Enumerate candidates, predict, score, pick best, and record why.
 
+        `load` maps node_id -> current queued/active sessions on that node. It is how
+        "more people on the network => faster" becomes real: every node that can run
+        the model is a REPLICA, and the scheduler routes each request to the best
+        replica for THAT request (fastest + closest + least loaded). Adding replicas
+        raises total concurrent capacity AND lowers the chance your request waits.
+
         Raises ValueError if no feasible plan exists (infeasible topology).
         """
+        load = load or {}
         model_bytes = self._quant_bytes(model)
         manifest_hash = model.manifest_hash()
         candidates: list[Candidate] = []
@@ -182,16 +191,26 @@ class Scheduler:
                 f"no node advertises a backend in {model.runtime.backends}; "
                 f"nodes have {[n.backends for n in nodes.values()]}")
 
-        # Candidate 1..k: SINGLE on each node that fits.
+        # REPLICA POOL: every node that fits the whole model is an interchangeable
+        # replica. Score each for THIS request (latency + its own queue wait) and the
+        # best one wins. This is load balancing + scale-out: it is the primary way
+        # more nodes make the network faster for everyone.
+        replicas = [n for n in compatible if self._fits_single(n, model_bytes, context_length)]
         for n in compatible:
-            if not self._fits_single(n, model_bytes, context_length):
+            if n not in replicas:
                 rejected.append(
                     f"single/{n.node_id}: model {model_bytes/1e9:.1f}GB + KV does not fit "
                     f"(vram {n.free_vram_bytes()/1e9:.1f}GB, ram {n.ram_free_bytes/1e9:.1f}GB)")
-                continue
+        for n in replicas:
             link = graph.link(client_node_id, n.node_id)
             ttft, tps, tr = self._predict_single(n, link, prompt_tokens, gen_tokens)
-            score = self._score(ttft, tps, [n], graph, [n.node_id])
+            # queue wait: requests already on this node each take ~one representative
+            # response at this node's rate before yours starts.
+            q = load.get(n.node_id, 0)
+            queue_wait = q * (256 / tps if tps > 0 else 0.0)
+            score = self._score(ttft, tps, [n], graph, [n.node_id], queue_wait_s=queue_wait)
+            if q:
+                tr = tr + [f"  queue: {q} ahead of you (~{queue_wait:.1f}s wait) on this replica"]
             candidates.append(Candidate(Strategy.SINGLE, [n.node_id], ttft, tps, score, tr))
 
         # Candidate: PIPELINE across the 2 highest-VRAM compatible nodes (proves the
@@ -213,6 +232,14 @@ class Scheduler:
         best = candidates[0]
 
         trace = list(best.trace)
+        # capacity note: more replicas => more concurrent sessions AND a better shot
+        # at a free/close node. This is the "more people = faster" scale-out property.
+        if len(replicas) >= 1:
+            busy = sum(1 for n in replicas if load.get(n.node_id, 0) > 0)
+            trace.insert(0, f"replica pool: {len(replicas)} node(s) can serve this model "
+                            f"({busy} busy); routed to the best replica for this request; "
+                            f"network serves up to {len(replicas)} concurrent session(s), "
+                            f"more nodes => less queueing + faster routing.")
         trace.insert(0, f"selected {best.strategy.value} "
                         f"(score {best.score:.2f}s: ttft {best.predicted_ttft_s:.2f}s, "
                         f"decode {best.predicted_decode_tps:.1f} tok/s)")

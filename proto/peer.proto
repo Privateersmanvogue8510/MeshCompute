@@ -1,0 +1,66 @@
+syntax = "proto3";
+package meshcompute.peer.v1;
+
+// Peer transport + rendezvous (internet-native NAT traversal, no VPN).
+// Mirrors api_models.py rendezvous section. The actual peer data plane uses the
+// compact binary ActivationFrame (see inference.proto / frames.py), NOT protobuf,
+// because large tensors must not pay JSON/protobuf encoding overhead per token.
+
+message PeerCandidate {
+  string node_id = 1;
+  string public_b64 = 2;
+  repeated string local_addrs = 3;     // host:port on LAN interfaces
+  string reflexive_addr = 4;           // STUN-discovered public host:port
+  uint32 quic_port = 5;
+  string nat_type = 6;                 // open|full-cone|restricted|symmetric|unknown
+  string relay_addr = 7;
+}
+
+message RendezvousAnnounce {
+  uint32 protocol_version = 1;
+  string node_id = 2;
+  string public_b64 = 3;
+  repeated string local_addrs = 4;
+  string reflexive_addr = 5;
+  uint32 quic_port = 6;
+  string nat_type = 7;
+  repeated string seeding_manifest_hashes = 8;   // BitTorrent-like content availability
+  string signature_b64 = 9;
+}
+
+message RendezvousPeers {
+  bool ok = 1;
+  repeated PeerCandidate peers = 2;
+  string your_reflexive_addr = 3;      // server-observed source (STUN-like)
+}
+
+message ConnectRequest {
+  string from_node_id = 1;
+  string to_node_id = 2;
+  string plan_id = 3;
+  string signature_b64 = 4;
+}
+
+message ConnectTicket {
+  bool ok = 1;
+  string session_id = 2;
+  PeerCandidate peer = 3;
+  string method = 4;                   // holepunch|direct|relay
+  string relay_url = 5;
+  double expires_at = 6;
+  string control_signature_b64 = 7;    // control-plane authorises the session
+}
+
+// Model distribution (content-addressed, BitTorrent-like) --------------------
+message ChunkRequest {
+  string manifest_hash = 1;
+  string rfilename = 2;
+  uint64 offset = 3;
+  uint32 length = 4;
+  string chunk_id = 5;                 // BLAKE3(manifest_hash||path||offset||bytes)
+}
+
+message ChunkHave {
+  string node_id = 1;
+  repeated string chunk_ids = 2;       // compact availability advertisement
+}

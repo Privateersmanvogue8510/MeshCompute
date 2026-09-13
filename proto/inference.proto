@@ -1,0 +1,44 @@
+syntax = "proto3";
+package meshcompute.inference.v1;
+
+// Inference session handshake + control. NOTE: the high-bandwidth activation /
+// KV / token payloads are carried by the compact BINARY ActivationFrame defined
+// in packages/protocol/meshcompute_protocol/frames.py, described here for
+// documentation only. Large tensors must not be serialized through protobuf/JSON
+// (PROTOCOL.md "Large tensor payloads should not be serialized through JSON").
+
+message InferenceSessionOpen {
+  uint32 protocol_version = 1;
+  string plan_id = 2;
+  string session_id = 3;
+  string model_manifest_hash = 4;
+  string strategy = 5;                 // single|pipeline|tensor|...
+  string context_parameters_json = 6;  // opaque, small
+  repeated string peer_chain = 7;
+  double expiration = 8;
+  string signed_ticket = 9;            // control-plane signature over the plan
+}
+
+// Documentation of the binary frame header (frames.py is the source of truth).
+// PacketClass: 0 CONTROL, 1 ACTIVATION, 2 KV_OP, 3 TOKEN_RESULT, 4 MODEL_CHUNK,
+//              5 TELEMETRY, 6 CANCEL, 7 WORK_RECEIPT
+// Dtype: 0 F32, 1 F16, 2 BF16, 3 I32, 4 U8, 255 RAW
+// Compression: 0 NONE, 1 ZLIB (optional, benchmark-driven)
+message ActivationFrameHeader {
+  uint32 protocol_version = 1;
+  uint32 packet_class = 2;
+  uint32 dtype = 3;
+  uint32 compression = 4;
+  uint64 request_id = 5;
+  uint32 step = 6;
+  uint32 microbatch = 7;
+  uint32 tensor_id = 8;
+  repeated uint32 shape = 9;
+  uint32 payload_length = 10;
+  // payload bytes follow the header on the wire (not a protobuf field)
+}
+
+message Cancel {
+  string session_id = 1;
+  uint64 request_id = 2;
+}
