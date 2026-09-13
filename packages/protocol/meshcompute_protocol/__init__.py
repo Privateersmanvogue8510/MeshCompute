@@ -46,6 +46,10 @@ from .session import (
 )
 from .receipts import WorkReceipt, SignedReceipt, MeasuredWork, Outcome
 from .frames import Frame, PacketClass, Dtype, Compression, MAX_PAYLOAD, MAX_NDIM
+from .ledger import (
+    LedgerEntry, BlockHeader, Block, Chain, ChainError,
+    merkle_root, credit_for_receipt, pick_best_chain, verify_block, GENESIS_PREV,
+)
 from .api_models import (
     RegisterRequest, RegisterResponse, HeartbeatRequest, HeartbeatResponse,
     NodeView, ModelView, ScheduleRequest,
@@ -66,4 +70,6 @@ __all__ = [
     "RegisterRequest", "RegisterResponse", "HeartbeatRequest", "HeartbeatResponse",
     "NodeView", "ModelView", "ScheduleRequest",
     "RendezvousAnnounce", "PeerCandidate", "RendezvousPeers", "ConnectRequest", "ConnectTicket",
+    "LedgerEntry", "BlockHeader", "Block", "Chain", "ChainError",
+    "merkle_root", "credit_for_receipt", "pick_best_chain", "verify_block", "GENESIS_PREV",
 ]
