@@ -1,0 +1,22 @@
+# MeshCompute node/deploy registry — EXAMPLE (safe to commit).
+# Copy to deploy/nodes.local.yaml (gitignored) and fill in REAL hosts there.
+# NEVER put real internal IPs, public IPs, or credentials in this example file.
+control_plane:
+  bind: "0.0.0.0:8080"
+  public_url: "https://rendezvous.example.org"   # public rendezvous/tracker URL
+gateway:
+  bind: "0.0.0.0:8081"
+nodes:
+  - name: gpu-pod-example
+    role: worker
+    backend: lmstudio
+    # endpoint the daemon proxies to (the OpenAI-compatible server on the pod)
+    backend_url: "http://LAN-IP-OF-POD:1234"
+    pool: public
+    gpus: 2
+  - name: cpu-helper-example
+    role: worker
+    backend: llamacpp
+    pool: public
+stun_servers:
+  - "stun.l.google.com:19302"

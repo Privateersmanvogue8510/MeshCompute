@@ -1,0 +1,49 @@
+# --- MeshCompute .gitignore ---
+# SECRETS & PRIVATE INFRA never enter git (this is a PUBLIC repo).
+# Real host IPs, tailnet names, node keys, and creds live only in these local files.
+deploy/*.local.*
+deploy/local.env
+deploy/nodes.local.yaml
+deploy/nodes.local.yml
+*.local.env
+secrets/
+*.key
+*.pem
+node-identity*.json
+*_id_ed25519*
+credentials*.json
+credentials*.jsonc
+
+# Runtime state / databases
+*.db
+*.sqlite
+*.sqlite3
+data/
+var/
+mesh-cache/
+*.log
+
+# Model weights (content-addressed, never committed)
+*.gguf
+*.safetensors
+*.bin
+models/cache/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+scratch/

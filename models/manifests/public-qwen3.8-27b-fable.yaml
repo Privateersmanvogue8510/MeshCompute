@@ -1,0 +1,95 @@
+# MeshCompute public model manifest — first engineering target.
+#
+# Pinned to the exact HF revision. This is the SOURCE manifest; the network
+# addresses the model by its BLAKE3 manifest_hash (see `mesh manifest sign`).
+# Weights are GGUF (non-executable) — no trust_remote_code on the public pool.
+#
+# NOTE: artifact_root_hash values below are the HF-reported blob SHAs as a
+# placeholder record. `scripts/pin_manifest.py` recomputes true BLAKE3 roots
+# from the actual files when a node has them cached; until then the manifest is
+# marked unsigned-pending in the catalog. (Deliberate Phase-1 step, not faked.)
+protocol_version: 1
+id: public/qwen3.8-27b-fable
+version: 1
+display_name: "Qwen3.8-27B TWIN-TURBO Fable Cold-Fusion (Uncensored, NEO MTP)"
+architecture: qwen35
+context_length_max: 262144
+context_length_configured: 32768        # KV-bounded POC context (card: min 8k-16k)
+
+upstream:
+  provider: DavidAU
+  repository: DavidAU/Qwen3.8-27B-TWIN-TURBO-Fable-Cold-Fusion-709-L-Uncensored-NM-DAU-NEO-MTP-GGUF
+  revision: 805e42b48be3feabb7c801365fff92a98edb90f2
+
+license:
+  id: Apache-2.0
+
+runtime:
+  min_meshcompute: 0.1.0
+  backends: [lmstudio, llamacpp]         # GGUF runtimes; sglang/vllm N/A for GGUF
+  required_backend_capabilities: [gguf, qwen35, mtp-optional]
+
+tokenizer:
+  revision: 805e42b48be3feabb7c801365fff92a98edb90f2
+
+chat_template:
+  revision: 805e42b48be3feabb7c801365fff92a98edb90f2
+  file: chat_template-tturbo.jinja
+
+tool_parser:
+  id: qwen3-coder-xml            # tested parser family; see compat_notes
+  notes: >
+    Tool calling needs Q4_K_M minimum (Q6 recommended), temp 0.6-0.7, rep pen off.
+    Use chat_template-toolcall2.jinja for agent/tool use. See model card pinned
+    community discussion for the temp fix.
+
+# Two candidate quants recorded. MAX-MTP-Q6_K is the card's recommendation and
+# fits comfortably on a single 2x3090 (48GB) pod.
+quantizations:
+  - id: Q6_K-MAX-MTP
+    mtp: true
+    notes: "card-recommended; MTP tensors Q8_0; keep temp<=1 for MTP acceptance"
+    files:
+      - rfilename: Qwen3.8-27B-TTURBO-Fable-C-Fusion-709-L-Uncen-NM-DAU-NEO-MAX-MTP-Q6_K.gguf
+        size_bytes: 24030000000
+        artifact_root_hash: "PENDING-recompute-from-cached-file"
+        chunk_bytes: 1048576
+  - id: Q6_K-MAX
+    mtp: false
+    notes: "non-MTP fallback; faster for creative/complex or temp>1 per card"
+    files:
+      - rfilename: Qwen3.8-27B-TTURBO-Fable-C-Fusion-709-L-Uncen-NM-DAU-NEO-MAX-Q6_K.gguf
+        size_bytes: 23580000000
+        artifact_root_hash: "PENDING-recompute-from-cached-file"
+        chunk_bytes: 1048576
+
+parallelism:
+  pipeline: true
+  tensor: "conditional"        # only inside a low-latency pod (2x3090 over PCIe)
+  expert: "no"                 # dense qwen35, not MoE
+  speculative_draft: false
+  replica: true
+
+sampling_defaults:              # card "thinking mode, precise coding" preset
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 20
+  min_p: 0.0
+  repetition_penalty: 1.0
+  presence_penalty: 0.0
+
+multimodal: true                # vision via mmproj (Phase-2 wiring)
+mmproj_files:
+  - rfilename: mmproj-F16.gguf
+    size_bytes: 930000000
+    artifact_root_hash: "PENDING-recompute-from-cached-file"
+    chunk_bytes: 1048576
+
+safety_notes: >
+  Uncensored/abliterated model. PUBLIC-POOL PRIVACY: an inference worker can observe
+  activations and prompt-derived state — do NOT market public-swarm inference as
+  confidential. Recommend private pool for sensitive data (SECURITY.md).
+compat_notes: >
+  qwen35 + MTP is supported by recent llama.cpp; LM Studio serves it today on the
+  2x3090 pod. Upstream llama.cpp issue #28196 notes qwen35 MTP is ~1.5-1.6x slower
+  on the Windows path than native Linux — a Linux worker is preferred for the pod.
