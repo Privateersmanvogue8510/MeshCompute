@@ -4,10 +4,14 @@
 # addresses the model by its BLAKE3 manifest_hash (see `mesh manifest sign`).
 # Weights are GGUF (non-executable) — no trust_remote_code on the public pool.
 #
-# NOTE: artifact_root_hash values below are the HF-reported blob SHAs as a
-# placeholder record. `scripts/pin_manifest.py` recomputes true BLAKE3 roots
-# from the actual files when a node has them cached; until then the manifest is
-# marked unsigned-pending in the catalog. (Deliberate Phase-1 step, not faked.)
+# NOTE: artifact_root_hash values below are still the "PENDING-..." placeholder:
+# nobody with a checkout of this repo has had the 24 GB files on disk yet.
+# Consequence: a node downloading this channel verifies file SIZE only, and
+# peer-to-peer chunk transfer cannot cross-check the reassembled file. To pin:
+# run `mesh manifest pin models/manifests/public-qwen3.8-27b-fable.yaml` on any
+# machine that has the files (it rewrites size_bytes + BLAKE3 in place), bump
+# `version`, commit — every node following the channel then re-downloads once
+# and verifies from then on. The control plane signs whatever is in this file.
 protocol_version: 1
 id: public/qwen3.8-27b-fable
 version: 1

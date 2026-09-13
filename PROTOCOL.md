@@ -165,6 +165,21 @@ Support:
 - peer scoring,
 - origin fallback.
 
+Phase-1 wire protocol (`node/runtime/meshcompute_runtime/swarm.py`), one file per stream:
+
+```text
+leecher -> seeder   CONTROL {"op":"want","manifest_hash":H,"rfilename":F}
+seeder  -> leecher  CONTROL {"op":"have"} | {"op":"nack"}   (nack: stream closes)
+leecher -> seeder   MODEL_CHUNK  payload = offset (u64 BE)            (repeated)
+seeder  -> leecher  MODEL_CHUNK  payload = offset(8) + chunk_id(64 hex) + bytes
+```
+
+Every chunk is verified against `chunk_id` before it is written; the whole
+file is verified against the manifest's `artifact_root_hash` at the end.
+Peers are found through the rendezvous tracker: an announce carries
+`seeding_manifest_hashes` (what a node holds) and `wanted_manifest_hashes`
+(what it is fetching), and the reply lists peers seeding either.
+
 ## Work receipts
 
 Every completed assignment produces a signed receipt containing:

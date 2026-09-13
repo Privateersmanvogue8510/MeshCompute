@@ -5,7 +5,6 @@ running backend and reads real GPU/RAM state instead of a claimed number.
 
 from __future__ import annotations
 
-import os
 import platform
 import re
 import subprocess
@@ -15,6 +14,7 @@ from meshcompute_protocol import BenchmarkResult, CapabilityRecord, Contribution
 from meshcompute_runtime.backends.base import BackendAdapter, BackendCapabilities, TokenChunk
 
 from .contribution import parse_gpu_devices
+from meshcompute_node.sysinfo import free_ram_bytes
 
 
 def _cpu_gpu(backend_names: list[str]) -> GpuInfo:
@@ -114,19 +114,8 @@ def detect_gpus(backend_names: list[str],
 
 
 def ram_free_bytes() -> int:
-    """psutil is intentionally not a dependency for one number: /proc/meminfo
-    covers Linux, os.sysconf covers the portable POSIX fallback (macOS/BSD)."""
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) * 1024
-    except OSError:
-        pass
-    try:
-        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-    except (ValueError, OSError, AttributeError):
-        return 0
+    """Available RAM (cross-platform; see sysinfo.py)."""
+    return free_ram_bytes()
 
 
 async def measure_capability(identity, backend: BackendAdapter, config: dict | None) -> CapabilityRecord:

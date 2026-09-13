@@ -66,10 +66,13 @@ instead, set `MESH_GW_CONTROL_URL` yourself.
 
 ### Node daemon
 
-No `MESH_*` env vars — every knob is a CLI flag or a keyword argument to
-`meshcompute_node.daemon.run()`/`async_main()`. See `docs/QUICKSTART.md` for the
-full flag table, and `CONFIGURATION.md` for the conceptual config shape they
-implement.
+| Var | Default | Meaning |
+|---|---|---|
+| `MESH_HOME` | `~/.mesh` | Where the node keeps its engine, model cache (`models/state.json` records which channel version each file belongs to), identity and logs |
+| `MESH_ACCEL` | auto | Force an engine build (`cuda`, `cuda-build`, `vulkan`, `metal`, `cpu`); same as `--accel` |
+| `HF_TOKEN` | unset | Sent to Hugging Face for gated repos during origin downloads |
+
+Everything else is a CLI flag (`docs/QUICKSTART.md` has the full table).
 
 ## `deploy/nodes.local.yaml`
 
@@ -167,6 +170,42 @@ This path is explicitly optional and secondary: an existing OpenAI endpoint is a
 *external backend*, not a requirement. The product default is a standalone node
 that never needs LM Studio/Ollama/vLLM at all.
 
+## Pushing a model-channel update
+
+A catalog alias is a **channel**. Nodes follow the channel they were started
+with and swap to whatever version the control plane publishes. To roll a new
+version of the same model class across the network:
+
+1. Get the new GGUF onto one machine (or just know its HF path) and edit the
+   channel's manifest in `models/manifests/`: bump `version`, update
+   `upstream.revision` if it changed, and the file entry (`rfilename`,
+   `size_bytes`, `artifact_root_hash`). `mesh manifest pin <yaml>` fills the
+   size and BLAKE3 from any local copy of the file.
+2. Drop the file into the control plane's manifest dir (the same path it loaded
+   at startup; with Docker Compose that's the mounted `models/manifests/`). The
+   control plane re-scans every 30 s, signs the new manifest, and starts
+   serving it as the channel's current version. Log line:
+   `channel public/smollm2-360m -> v2 (<hash>)`.
+3. Each node, on its next poll (`--update-poll`, default 5 min), downloads the
+   new files from peers that already have them (the first few nodes fall back
+   to Hugging Face), verifies them, swaps its engine on the same port, and
+   deletes the old files. Nodes log `channel <alias>: now serving v2; deleted 1
+   old file(s)`. The changeover is organic: nodes move as they finish
+   downloading, and a node that fails to start the new version keeps serving
+   the old one and retries next poll. Nodes in the same wave coordinate through
+   the tracker: the first node to ask for the new file is named its origin
+   leader and downloads from Hugging Face; the others wait for it and then fetch
+   peer-to-peer (`peer <id> is already fetching ... waiting` in their logs).
+
+Rules the control plane enforces: a manifest whose `version` is **lower** than
+the published one is refused (rollback = push a higher version pointing at the
+old file); a manifest with the same hash is a no-op. Nodes ignore a catalog
+offering a lower version than they run.
+
+This is for **new versions of the same model class**. Replacing a channel with
+an entirely different model is technically the same operation, but every
+follower will download the full new model — treat it as a new channel instead.
+
 ## Multi-node `llama.cpp` RPC layer-split runbook
 
 For a model too large for one GPU but small enough to split pipeline-style across
@@ -248,6 +287,12 @@ From `SECURITY.md` (full detail there) — the parts that matter operationally:
 - **The control plane is not the inference data path.** It never sees prompt
   bodies and holds no tool credentials — its job is auth, registration,
   rendezvous, catalog, and scheduling metadata only.
+- **Registration, heartbeats and rendezvous requests are signed** by the
+  node's key, and a node_id is derived from that key — nobody can register a
+  foreign key under someone's id, keep a dead node "online", or spoof its free
+  RAM. Work receipts are credited only for a plan the scheduler actually issued,
+  to a node in that plan, with a challenge nonce the control plane handed out,
+  and with GPU time that fits the receipt's own time window.
 - **Node identity keys are Ed25519, self-generated, gitignored.**
   `deploy/identities/*.key.json` and anything matching `*.key.json` /
   `*_id_ed25519*` / `credentials*.json` in `.gitignore` must never be committed;
@@ -267,10 +312,15 @@ Unit files: `infra/systemd/mesh-control-plane.service`,
 `User=`, `WorkingDirectory=`, and venv path placeholders before installing.
 
 Compose (control plane + gateway only — nodes normally run on contributor
-machines, not in this compose file): `infra/compose/docker-compose.yml`.
+machines, not in this compose file): `infra/compose/docker-compose.yml`. The
+gateway mounts `deploy/nodes.local.yaml`, so create it first:
 
 ```bash
+cp deploy/nodes.example.yaml deploy/nodes.local.yaml   # then add your nodes
 docker compose -f infra/compose/docker-compose.yml up -d
 ```
+
+The image is built from `infra/docker/Dockerfile` (verified: builds and both
+services import inside the container).
 
 See the comments in both for what to edit for your environment.

@@ -248,9 +248,52 @@ def node_status() -> None:
     console.print(table)
 
 
+@node.command("models")
+@click.option("--control-url", default=None)
+def node_models(control_url: str | None) -> None:
+    """List model channels you can contribute to, with size and whether they fit here."""
+    import asyncio
+
+    from meshcompute_node import daemon as node_daemon
+    from meshcompute_node.contribution import per_gpu_free_vram_bytes, total_ram_bytes
+    from meshcompute_runtime import runtime_installer as ri
+
+    control = control_url or get_control_url()
+    catalog = asyncio.run(node_daemon.fetch_catalog(control))
+    vram = sum(per_gpu_free_vram_bytes("auto").values())
+    budget = vram or total_ram_bytes()
+    state = ri.load_state()
+    table = Table(title=f"model channels @ {control} (budget here: {_human_bytes(budget)} "
+                        f"{'VRAM' if vram else 'RAM'})")
+    for col in ("channel", "version", "size", "fits", "installed", "name"):
+        table.add_column(col)
+    for m in catalog:
+        t = ri.model_target(m)
+        have = state["channels"].get(m.id, {})
+        table.add_row(m.id, str(m.version), _human_bytes(t.total_bytes),
+                      "yes" if node_daemon.fits(m, budget) else "no",
+                      f"v{have['version']}" if have else "-", m.display_name)
+    console.print(table)
+    if state.get("selected_alias"):
+        console.print(f"[dim]selected: {state['selected_alias']} (change with mesh node start --model)[/dim]")
+
+
 @node.command("start")
+@click.option("--model", default=None,
+              help='Model channel to contribute to and use, e.g. "public/qwen3.8-27b-fable"; '
+                   '"smoke" = built-in tiny CPU model. Omit to pick interactively (choice is saved).')
+@click.option("--quant", default=None,
+              help="Quantization id from the manifest (default: its first/recommended).")
+@click.option("--port", default=None, type=int,
+              help=f"Local OpenAI endpoint port (default {8099}; stable across model updates).")
+@click.option("--quic-port", default=0, type=int, help="UDP port for the peer data plane (0 = any).")
+@click.option("--accel", type=click.Choice(["auto", "cuda", "cuda-build", "vulkan", "metal", "cpu"]),
+              default="auto", help="Accelerator build to use. cuda-build compiles llama.cpp with CUDA "
+                                   "on Linux (needs cmake+nvcc); default on Linux+NVIDIA is the Vulkan "
+                                   "prebuilt.")
 @click.option("--backend", type=click.Choice(["lmstudio", "llamacpp"]), default="llamacpp")
-@click.option("--backend-url", default=None, help="URL of the local inference backend.")
+@click.option("--backend-url", default=None,
+              help="URL of an existing OpenAI-compatible backend (with --backend lmstudio).")
 @click.option("--pool", "pool_id", default="public")
 @click.option("--idle-only/--no-idle-only", default=True,
               help="Only contribute to the network while this machine is idle.")
@@ -262,6 +305,8 @@ def node_status() -> None:
 @click.option("--max-cpu", "max_cpu_percent", default=50, type=int, help="Max CPU percent to contribute.")
 @click.option("--max-ram", "max_ram_gb", default=None, type=int,
               help="Max RAM, in GB, to contribute (unset = no explicit cap).")
+@click.option("--max-storage", "max_storage_gb", default=100, type=int,
+              help="Max disk, in GB, for cached/seeded model files (default 100).")
 @click.option("--require-ac-power/--no-require-ac-power", default=False,
               help="Only contribute while on AC power (laptops).")
 @click.option("--gpu-devices", default="auto",
@@ -272,37 +317,31 @@ def node_status() -> None:
 @click.option("--tensor-split", default=None,
               help='Explicit per-GPU split proportions, e.g. "3,1" (default: '
                    "proportional to each selected GPU's free VRAM).")
+@click.option("--update-poll", "update_poll_s", default=300, type=int,
+              help="Seconds between checks for a pushed model-channel update (default 300).")
 @click.option("--control-url", default=None)
-def node_start(backend: str, backend_url: str | None, pool_id: str, idle_only: bool,
+def node_start(model: str | None, quant: str | None, port: int | None, quic_port: int, accel: str,
+               backend: str, backend_url: str | None, pool_id: str, idle_only: bool,
                idle_minutes_before_start: int, pause_on_user_activity: bool,
                max_vram_percent: int, max_cpu_percent: int, max_ram_gb: int | None,
-               require_ac_power: bool, gpu_devices: str, split_mode: str,
-               tensor_split: str | None, control_url: str | None) -> None:
-    """Start the node daemon (contributes capacity to the mesh)."""
-    try:
-        from meshcompute_node import daemon as node_daemon
-    except ImportError:
-        console.print(
-            "[yellow]node daemon not yet available in this build; run: "
-            "mesh node start (again) once node/daemon/meshcompute_node/daemon.py lands.[/yellow]"
-        )
-        sys.exit(0)
+               max_storage_gb: int, require_ac_power: bool, gpu_devices: str, split_mode: str,
+               tensor_split: str | None, update_poll_s: int, control_url: str | None) -> None:
+    """Start the node daemon: self-installs the engine, gets the model from peers
+    or Hugging Face, serves a local OpenAI endpoint, contributes to the mesh, and
+    follows its model channel's updates."""
+    from meshcompute_node import daemon as node_daemon
 
     control = control_url or get_control_url()
-    opts = dict(backend=backend, backend_url=backend_url, pool_id=pool_id,
-                idle_only=idle_only, idle_minutes_before_start=idle_minutes_before_start,
-                pause_on_user_activity=pause_on_user_activity,
-                max_vram_percent=max_vram_percent, max_cpu_percent=max_cpu_percent,
-                max_ram_gb=max_ram_gb, require_ac_power=require_ac_power,
-                gpu_devices=gpu_devices, split_mode=split_mode, tensor_split=tensor_split,
-                control_url=control)
-    if hasattr(node_daemon, "run"):
-        node_daemon.run(**opts)
-    elif hasattr(node_daemon, "async_main"):
-        import asyncio
-        asyncio.run(node_daemon.async_main(**opts))
-    else:
-        _die("meshcompute_node.daemon has neither run() nor async_main(); cannot start.")
+    node_daemon.run(
+        model=model, quant=quant, port=port, quic_port=quic_port,
+        accel=None if accel == "auto" else accel,
+        backend=backend, backend_url=backend_url, pool_id=pool_id,
+        idle_only=idle_only, idle_minutes_before_start=idle_minutes_before_start,
+        pause_on_user_activity=pause_on_user_activity,
+        max_vram_percent=max_vram_percent, max_cpu_percent=max_cpu_percent,
+        max_ram_gb=max_ram_gb, max_storage_gb=max_storage_gb, require_ac_power=require_ac_power,
+        gpu_devices=gpu_devices, split_mode=split_mode, tensor_split=tensor_split,
+        update_poll_s=float(update_poll_s), control_url=control)
 
 
 # ----------------------------------------------------------------------------- api
@@ -313,8 +352,9 @@ def api() -> None:
 
 @api.command("serve")
 @click.option("--port", default=8081, type=int)
+@click.option("--host", default="127.0.0.1", help="Bind address (0.0.0.0 to expose on the LAN).")
 @click.option("--control-url", default=None)
-def api_serve(port: int, control_url: str | None) -> None:
+def api_serve(port: int, host: str, control_url: str | None) -> None:
     """Launch the gateway (OpenAI-compatible + native HTTP surface)."""
     try:
         import uvicorn
@@ -327,9 +367,13 @@ def api_serve(port: int, control_url: str | None) -> None:
         sys.exit(0)
 
     import os
-    os.environ["MESH_CONTROL_URL"] = control_url or get_control_url()
-    console.print(f"[dim]starting gateway on 127.0.0.1:{port} (control={os.environ['MESH_CONTROL_URL']})[/dim]")
-    uvicorn.run("meshcompute_gateway.app:app", host="127.0.0.1", port=port)
+    control = control_url or get_control_url()
+    os.environ["MESH_CONTROL_URL"] = control
+    # the gateway's own settings read MESH_GW_CONTROL_URL — without this, --control-url
+    # never reaches it and the gateway silently talks to its default control plane.
+    os.environ["MESH_GW_CONTROL_URL"] = control
+    console.print(f"[dim]starting gateway on {host}:{port} (control={control})[/dim]")
+    uvicorn.run("meshcompute_gateway.app:app", host=host, port=port)
 
 
 # ---------------------------------------------------------------------------- pool
@@ -397,7 +441,8 @@ def manifest() -> None:
 
 @manifest.command("sign")
 @click.argument("path", type=click.Path(exists=True, dir_okay=False))
-@click.option("--key", default="deploy/identities/cli.key.json", help="Node identity key file (created if missing).")
+@click.option("--key", default="deploy/identities/cli.key.json",
+              help="Node identity key file (created if missing).")
 @click.option("--out", "out_path", default=None, help="Output SignedManifest json path.")
 def manifest_sign(path: str, key: str, out_path: str | None) -> None:
     """Sign a YAML ModelManifest, writing a SignedManifest json."""
@@ -409,7 +454,9 @@ def manifest_sign(path: str, key: str, out_path: str | None) -> None:
     manifest_hash = mf.manifest_hash()
 
     ident = NodeIdentity.load_or_create(key)
-    signature_b64 = ident.sign(manifest_hash.encode("utf-8"))
+    # Canonical scheme (same as the control plane's scan_manifests): sign the
+    # manifest BODY, not the hash string, so either signer's output verifies here.
+    signature_b64 = ident.sign_json(mf.model_dump(mode="json"))
 
     signed = SignedManifest(manifest=mf, manifest_hash=manifest_hash,
                              public_b64=ident.public_b64, signature_b64=signature_b64)
@@ -420,12 +467,49 @@ def manifest_sign(path: str, key: str, out_path: str | None) -> None:
     console.print(f"[dim]signed by {ident.node_id} -> {out}[/dim]")
 
 
+@manifest.command("pin")
+@click.argument("path", type=click.Path(exists=True, dir_okay=False))
+@click.option("--cache", "cache_dir", default=None,
+              help="Model cache to look in for the files (default ~/.mesh/models).")
+@click.option("--file", "extra_files", multiple=True, type=click.Path(exists=True, dir_okay=False),
+              help="Explicit GGUF path(s) to hash, in addition to the cache.")
+def manifest_pin(path: str, cache_dir: str | None, extra_files: tuple[str, ...]) -> None:
+    """Replace PENDING artifact_root_hash / size_bytes in a manifest YAML with the
+    real BLAKE3 + size of the matching local files (by rfilename). Run this once
+    the files are downloaded, then bump `version` and sign/publish."""
+    import re
+
+    from meshcompute_runtime.runtime_installer import DEFAULT_MODEL_CACHE, blake3_file
+
+    root = Path(cache_dir) if cache_dir else DEFAULT_MODEL_CACHE
+    local: dict[str, Path] = {p.name: p for p in root.rglob("*.gguf")} if root.is_dir() else {}
+    local.update({Path(f).name: Path(f) for f in extra_files})
+    text = Path(path).read_text()
+    pinned = 0
+    shard_re = (r"rfilename:\s*(\S+)\s*\n(\s+)size_bytes:\s*\d+\s*\n"
+                r"\s+artifact_root_hash:\s*\"?[^\"\n]*\"?")
+    for m in re.finditer(shard_re, text):
+        name = m.group(1)
+        f = local.get(name)
+        if f is None:
+            console.print(f"[yellow]{name}: not found locally, left as-is[/yellow]")
+            continue
+        indent = m.group(2)
+        digest, size = blake3_file(f), f.stat().st_size
+        repl = (f"rfilename: {name}\n{indent}size_bytes: {size}\n{indent}artifact_root_hash: "
+                f"\"{digest}\"")
+        text = text.replace(m.group(0), repl)
+        pinned += 1
+        console.print(f"[green]{name}[/green]: {size} bytes, blake3 {digest[:16]}…")
+    Path(path).write_text(text)
+    console.print(f"pinned {pinned} file(s) in {path}")
+
+
 @manifest.command("verify")
 @click.argument("path", type=click.Path(exists=True, dir_okay=False))
 def manifest_verify(path: str) -> None:
     """Verify a SignedManifest's signature and that manifest_hash matches the content."""
-    from meshcompute_protocol import SignedManifest
-    from meshcompute_protocol import verify as verify_signature
+    from meshcompute_protocol import SignedManifest, verify_json
 
     try:
         signed = SignedManifest.model_validate_json(Path(path).read_text())
@@ -435,7 +519,8 @@ def manifest_verify(path: str) -> None:
 
     recomputed = signed.manifest.manifest_hash()
     hash_ok = recomputed == signed.manifest_hash
-    sig_ok = verify_signature(signed.public_b64, signed.manifest_hash.encode("utf-8"), signed.signature_b64)
+    sig_ok = verify_json(signed.public_b64, signed.manifest.model_dump(mode="json"),
+                         signed.signature_b64)
 
     if hash_ok and sig_ok:
         console.print(f"[green]OK[/green] manifest_hash={signed.manifest_hash}")

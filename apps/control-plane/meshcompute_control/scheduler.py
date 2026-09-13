@@ -78,29 +78,33 @@ class Scheduler:
         self.cost = cost or CostModel()
 
     # --- model fit -----------------------------------------------------------
-    def _quant_bytes(self, manifest: ModelManifest, prefer_mtp: bool = True) -> int:
-        best = None
-        for q in manifest.quantizations:
-            total = sum(f.size_bytes for f in q.files)
-            if total == 0:
-                continue
-            if prefer_mtp and q.mtp and best is not None:
-                # prefer an mtp quant of similar size; keep the smaller feasible one
-                pass
-            if best is None or total < best:
-                best = total
-        return best or 0
+    def _quant_bytes(self, manifest: ModelManifest) -> int:
+        """Bytes of the catalog's FIRST-listed quantization — the one nodes
+        actually install (runtime_installer.pick_quant), so model-fit is judged
+        against the files a node really loads, not the smallest option."""
+        if not manifest.quantizations:
+            return 0
+        return sum(f.size_bytes for f in manifest.quantizations[0].files)
+
+    def _kv_allowance(self, model_bytes: int, ctx: int) -> int:
+        """KV cache budget beside the weights. KV ~ ctx * layers * heads is
+        model-specific; use a coarse 20% of weights per 32k ctx as the POC
+        allowance. Single-node fit and split fit must use the SAME allowance."""
+        return int(model_bytes * 0.20 * max(ctx, 1) / 32768)
+
+    def _usable_bytes(self, node: CapabilityRecord) -> int:
+        """Memory a node can actually load weights+KV into. CPU-only nodes
+        advertise vram 0 but can run from RAM (slow), so fall back to RAM."""
+        vram = node.free_vram_bytes() or node.total_vram_bytes()
+        return vram if vram else node.ram_free_bytes
 
     def _fits_single(self, node: CapabilityRecord, model_bytes: int, ctx: int) -> bool:
-        # weights + a KV allowance. KV ~ ctx * layers * heads is model-specific;
-        # use a coarse 20% of weights per 32k ctx as the POC allowance.
-        kv_allow = int(model_bytes * 0.20 * max(ctx, 1) / 32768)
-        need = model_bytes + kv_allow
-        vram = node.free_vram_bytes() or node.total_vram_bytes()
-        # CPU-only nodes advertise vram 0 but can run from RAM (slow) — allow if RAM fits.
-        if vram == 0:
-            return node.ram_free_bytes >= need
-        return vram >= need
+        return self._usable_bytes(node) >= model_bytes + self._kv_allowance(model_bytes, ctx)
+
+    def _can(self, node: CapabilityRecord, strategy: str) -> bool:
+        """Does the node advertise that it can take part in this strategy?
+        An empty list is an older/plain node: whole-model work only."""
+        return strategy in (node.strategies or ["single", "replica"])
 
     # --- cost prediction -----------------------------------------------------
     def _node_decode_tps(self, node: CapabilityRecord) -> float:
@@ -218,8 +222,14 @@ class Scheduler:
              graph: TopologyGraph, client_node_id: str, context_length: int,
              prompt_tokens: int = 512, gen_tokens: int = 256,
              load: dict[str, int] | None = None,
+             executable_strategies: list[str] | None = None,
              plan_id: str = "plan_0") -> ExecutionPlan:
         """Enumerate candidates, predict, score, pick best, and record why.
+
+        `executable_strategies` is what the CALLER can actually run (the Phase-1
+        gateway drives one OpenAI-compatible backend, so it sends ["single"]).
+        Empty/None = no restriction; otherwise strategies outside it are never
+        proposed — a plan the caller cannot execute is worse than no plan.
 
         `load` maps node_id -> current queued/active sessions on that node. It is how
         "more people on the network => faster" becomes real: every node that can run
@@ -234,6 +244,15 @@ class Scheduler:
         manifest_hash = model.manifest_hash()
         candidates: list[Candidate] = []
         rejected: list[str] = []
+        allowed = set(executable_strategies or ())
+
+        def executable(s: Strategy) -> bool:
+            if not allowed or s.value in allowed:
+                return True
+            line = f"{s.value}: not executable by caller"
+            if line not in rejected:
+                rejected.append(line)
+            return False
 
         compatible = [n for n in nodes.values()
                       if any(b in model.runtime.backends for b in n.backends)]
@@ -252,7 +271,7 @@ class Scheduler:
                 rejected.append(
                     f"single/{n.node_id}: model {model_bytes/1e9:.1f}GB + KV does not fit "
                     f"(vram {n.free_vram_bytes()/1e9:.1f}GB, ram {n.ram_free_bytes/1e9:.1f}GB)")
-        for n in replicas:
+        for n in (replicas if executable(Strategy.SINGLE) else []):
             link = graph.link(client_node_id, n.node_id)
             ttft, tps, tr = self._predict_single(n, link, prompt_tokens, gen_tokens)
             # queue wait: requests already on this node each take ~one representative
@@ -266,31 +285,50 @@ class Scheduler:
 
         # Candidate: PIPELINE across the 2 highest-VRAM compatible nodes (proves the
         # split path). Only offered when the model needs it OR to compare cost.
-        if len(compatible) >= 2:
-            ranked = sorted(compatible, key=lambda n: n.free_vram_bytes(), reverse=True)[:2]
-            ttft, tps, tr = self._predict_pipeline(ranked, graph, graph.link(
-                client_node_id, ranked[0].node_id), prompt_tokens, gen_tokens)
+        splitters = [n for n in compatible if self._can(n, "pipeline")]
+        if len(splitters) >= 2 and executable(Strategy.PIPELINE):
+            ranked = sorted(splitters, key=lambda n: n.free_vram_bytes(), reverse=True)[:2]
             chain = [n.node_id for n in ranked]
-            score = self._score(ttft, tps, ranked, graph, chain)
-            candidates.append(Candidate(Strategy.PIPELINE, chain, ttft, tps, score, tr))
+            # a split only works if the chain can JOINTLY hold weights + KV; two
+            # 8GB nodes do not add up to a 500GB model.
+            combined = sum(self._usable_bytes(n) for n in ranked)
+            needed = model_bytes + self._kv_allowance(model_bytes, context_length)
+            if combined < needed:
+                rejected.append(
+                    f"pipeline/{chain[0]}+{chain[1]}: combined memory "
+                    f"{combined/1e9:.1f} GB < needed {needed/1e9:.1f} GB")
+            else:
+                ttft, tps, tr = self._predict_pipeline(ranked, graph, graph.link(
+                    client_node_id, ranked[0].node_id), prompt_tokens, gen_tokens)
+                score = self._score(ttft, tps, ranked, graph, chain)
+                candidates.append(Candidate(Strategy.PIPELINE, chain, ttft, tps, score, tr))
 
         # SPEED candidates: more (close/fast) nodes -> a single request runs FASTER.
         # TENSOR pod: 2+ fitting replicas mutually on a LAN-class link (NVLINK/LAN/PCIe)
         # -> tensor-parallel, single-request decode scales with node count.
+        tensor_capable = [n for n in replicas if self._can(n, "tensor")]
         for size in (3, 2):
-            pod = [n for n in replicas][:size]
-            if len(pod) == size and self._mutually_lan_class(graph, [n.node_id for n in pod]):
+            pod = tensor_capable[:size]
+            if (len(pod) == size and self._mutually_lan_class(graph, [n.node_id for n in pod])
+                    and executable(Strategy.TENSOR)):
                 ttft, tps, tr = self._predict_tensor(
                     pod, graph, graph.link(client_node_id, pod[0].node_id), prompt_tokens)
                 chain = [n.node_id for n in pod]
-                score = self._score(ttft, tps, pod, graph, chain)
+                # the pod is only as free as its busiest member — a loaded pod
+                # loses to an idle far replica, same queue formula as SINGLE.
+                q = max(load.get(n.node_id, 0) for n in pod)
+                queue_wait = q * (256 / tps if tps > 0 else 0.0)
+                score = self._score(ttft, tps, pod, graph, chain, queue_wait_s=queue_wait)
+                if q:
+                    tr = tr + [f"  queue: {q} ahead of you (~{queue_wait:.1f}s wait) on this pod"]
                 candidates.append(Candidate(Strategy.TENSOR, chain, ttft, tps, score, tr))
                 break
         # SPECULATIVE: a strong replica + any draft-capable peer within a tolerable RTT
         # of it -> single-stream speedup (extra node accelerates one request).
-        if replicas:
+        if replicas and executable(Strategy.SPECULATIVE):
             strong = max(replicas, key=self._node_decode_tps)
             drafts = [n for n in compatible if n.node_id != strong.node_id
+                      and (self._can(n, "speculative") or self._can(n, "draft"))
                       and graph.link(strong.node_id, n.node_id).rtt_ms
                       <= self.cost.speculative_max_rtt_ms]
             if drafts:
@@ -298,7 +336,12 @@ class Scheduler:
                 ttft, tps, tr = self._predict_speculative(
                     strong, draft, graph, graph.link(client_node_id, strong.node_id),
                     prompt_tokens)
-                score = self._score(ttft, tps, [strong], graph, [strong.node_id])
+                q = load.get(strong.node_id, 0)
+                queue_wait = q * (256 / tps if tps > 0 else 0.0)
+                score = self._score(ttft, tps, [strong], graph, [strong.node_id],
+                                    queue_wait_s=queue_wait)
+                if q:
+                    tr = tr + [f"  queue: {q} ahead of you (~{queue_wait:.1f}s wait) on the verifier"]
                 candidates.append(Candidate(Strategy.SPECULATIVE,
                                             [strong.node_id, draft.node_id], ttft, tps, score, tr))
 

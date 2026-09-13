@@ -30,7 +30,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from .content import blake3_hex
-from .identity import NodeIdentity, canonical_json, node_id_from_public, verify_json, verify
+from .identity import NodeIdentity, canonical_json, node_id_from_public, verify_json
 from .receipts import SignedReceipt, Outcome
 from .versioning import PROTOCOL_VERSION
 
@@ -147,6 +147,14 @@ def verify_block(block: Block, *, expected_prev_hash: str, expected_index: int,
     # per-entry validation
     local_nonces: set[str] = set()
     for e in block.entries:
+        # MINTING RULE: only receipt-backed verified work may ADD credit. Without
+        # this a producer could mint an arbitrary balance with a "correction".
+        # Phase 1 has no authorization scheme for a positive correction (that needs
+        # multi-producer/quorum sign-off), so corrections may only take credit away.
+        if e.delta > 0 and e.reason != "verified_work":
+            raise ChainError(
+                f"entry {e.entry_id}: delta > 0 requires reason 'verified_work' "
+                f"(got {e.reason!r}); positive corrections are not authorizable in Phase 1")
         if e.reason == "verified_work":
             if require_receipts:
                 if e.receipt is None:
@@ -174,7 +182,9 @@ def verify_block(block: Block, *, expected_prev_hash: str, expected_index: int,
                 raise ChainError(f"entry {e.entry_id}: nonce reused (double-credit)")
             local_nonces.add(nonce)
         elif e.reason in ("consumption", "correction"):
-            pass  # spends/corrections: Phase-2 rules (balance checks, authorization)
+            if e.reason == "consumption" and e.delta >= 0:
+                raise ChainError(f"entry {e.entry_id}: consumption must have delta < 0")
+            # remaining Phase-2 rules for spends: balance/overdraft checks
         else:
             raise ChainError(f"entry {e.entry_id}: unknown reason {e.reason!r}")
     seen_nonces |= local_nonces

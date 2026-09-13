@@ -27,39 +27,20 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
 
 from meshcompute_protocol import ContributionPolicy
 
+# Cross-platform host signals (Linux/macOS/Windows) live in sysinfo.py; the
+# nvidia-smi ones stay here because they are the same on every OS.
+from meshcompute_node.sysinfo import (  # noqa: F401  (re-exported for callers/tests)
+    cpu_load_percent,
+    free_ram_bytes,
+    on_ac_power,
+    total_ram_bytes,
+    user_idle_seconds,
+)
+
 # --------------------------------------------------------------------------- raw signals
-
-
-def user_idle_seconds() -> float | None:
-    """Seconds since the last user input, or None if no signal is available
-    (headless box, or a Wayland session where XWayland input doesn't route
-    through xprintidle).
-    TODO(phase-1.5): a real Wayland idle signal (ext-idle-notify-v1) and a
-    Windows/macOS equivalent; xprintidle only covers a real X11 session.
-    """
-    if os.environ.get("DISPLAY") and shutil.which("xprintidle"):
-        try:
-            out = subprocess.run(["xprintidle"], capture_output=True, text=True, timeout=3)
-            if out.returncode == 0 and out.stdout.strip():
-                return int(out.stdout.strip()) / 1000.0
-        except (OSError, subprocess.SubprocessError, ValueError):
-            pass
-    return None
-
-
-def cpu_load_percent() -> float:
-    """Recent CPU business as a % of all cores, from the 1-minute load
-    average — stdlib only, no /proc/stat delta-sampling needed."""
-    try:
-        load1, _, _ = os.getloadavg()
-    except (OSError, AttributeError):
-        return 0.0
-    ncores = os.cpu_count() or 1
-    return min(100.0, 100.0 * load1 / ncores)
 
 
 def gpu_util_percent() -> float | None:
@@ -160,43 +141,6 @@ def total_vram_bytes(gpu_devices: str | list[int] | None = "auto") -> int:
             continue
         total += int(float(mib_s)) * (1 << 20)
     return total
-
-
-def total_ram_bytes() -> int:
-    """Total physical RAM. /proc/meminfo on Linux, os.sysconf portable
-    fallback (macOS/BSD) — mirrors capability.py's ram_free_bytes() but for
-    the total instead of the currently-available figure."""
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemTotal:"):
-                    return int(line.split()[1]) * 1024
-    except OSError:
-        pass
-    try:
-        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-    except (ValueError, OSError, AttributeError):
-        return 0
-
-
-def on_ac_power() -> bool | None:
-    """True/False from /sys/class/power_supply, or None when there's no
-    battery at all (a desktop with no power_supply entries — like this box —
-    is never blocked by require_ac_power)."""
-    base = Path("/sys/class/power_supply")
-    if not base.is_dir():
-        return None
-    entries = list(base.iterdir())
-    if not entries:
-        return None
-    for entry in entries:
-        with contextlib.suppress(OSError):
-            if (entry / "type").read_text().strip() == "Mains":
-                return (entry / "online").read_text().strip() == "1"
-    for entry in entries:  # no Mains node — infer from a battery's charge status
-        with contextlib.suppress(OSError):
-            return (entry / "status").read_text().strip() != "Discharging"
-    return None
 
 
 @dataclass

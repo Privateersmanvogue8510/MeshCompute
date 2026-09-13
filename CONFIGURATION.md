@@ -69,3 +69,20 @@ Contributor UI must include:
 - current sessions and resource usage.
 
 Stopping contribution must stop accepting new work immediately and drain or cancel current work according to the user's selected policy.
+
+## What is implemented today (Phase 1)
+
+The YAML above is the target shape; the working interface is `mesh node start`
+(`docs/QUICKSTART.md` has the table). Mapping:
+
+| Config key | Flag | Enforced by |
+|---|---|---|
+| `compute.gpu_devices` | `--gpu-devices` | `CUDA_VISIBLE_DEVICES` / `GGML_VK_VISIBLE_DEVICES` on the engine |
+| `compute.max_vram_percent` | `--max-vram` | advertised free VRAM is capped to the share |
+| `compute.max_cpu_percent` | `--max-cpu` | engine `--threads`; idle gate on CPU load |
+| `compute.max_ram_gb` | `--max-ram` | context size bound |
+| `storage.max_cache_gb` | `--max-storage` | refuses downloads over budget; advertised as `storage_share_bytes` |
+| `storage.seed_model_chunks` | always on | every file in `state.json` is seeded to peers |
+| `availability.*` | `--idle-only`, `--idle-minutes`, `--pause-on-activity`, `--require-ac-power` | `contribution.py` + cross-platform `sysinfo.py` |
+| `thermal.gpu_temperature_limit_c` | (policy field only) | not yet gated on |
+| `network.max_*_mbps`, `allow_relay`, `allow_lan_discovery`, `availability.schedule` | — | not implemented yet |

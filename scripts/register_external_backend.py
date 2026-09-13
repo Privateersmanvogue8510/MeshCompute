@@ -22,12 +22,13 @@ from pathlib import Path
 import httpx
 import yaml
 
-sys.path[:0] = ["packages/protocol", "node/runtime"]
+sys.path[:0] = ["packages/protocol", "node/runtime", "node/daemon"]
 from meshcompute_protocol import (  # noqa: E402
     NodeIdentity, CapabilityRecord, GpuInfo, BenchmarkResult, SignedCapability,
     RegisterRequest, HeartbeatRequest,
 )
 from meshcompute_runtime.backends import OpenAICompatBackend, ChatRequest  # noqa: E402
+from meshcompute_node.daemon import signed_body  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 LOCAL = REPO / "deploy" / "nodes.local.yaml"
@@ -66,7 +67,8 @@ async def main() -> None:
 
     backend = OpenAICompatBackend(backend_url, backend_name=node_cfg.get("backend", "lmstudio"))
     if not await backend.health():
-        print(f"backend {backend_url} not reachable"); sys.exit(1)
+        print(f"backend {backend_url} not reachable")
+        sys.exit(1)
     models = await backend.list_models()
     model = models[0]
     print(f"backend up: {backend_url}, model {model}")
@@ -84,9 +86,13 @@ async def main() -> None:
         gpus=[GpuInfo(vendor="nvidia", model="RTX 3090", vram_bytes=vram_each,
                       free_vram_bytes=vram_each, backend_support=["cuda", "lmstudio"])
               for _ in range(gpus)],
-        ram_free_bytes=64_000_000_000,
+        ram_free_bytes=int(node_cfg.get("ram_free_bytes", 64_000_000_000)),
+        # The GPU/RAM figures above are OPERATOR-DECLARED (nodes.local.yaml), not
+        # measured — this script bridges a box we have no shell on. Only the
+        # decode tok/s is a live measurement. A real `mesh node start` node
+        # measures all of it (capability.py).
         benchmark=BenchmarkResult(decode_tokens_per_sec=decode_tps,
-                                  measured_model=model, measured_at="live"))
+                                  measured_model=model, measured_at="live; hardware operator-declared"))
     # node_id -> backend_url mapping is carried in deploy/nodes.local.yaml (written
     # below), which is how the gateway resolves the worker endpoint.
     signed = SignedCapability(record=rec, public_b64=ident.public_b64,
@@ -94,8 +100,8 @@ async def main() -> None:
 
     async with httpx.AsyncClient(timeout=15.0) as c:
         r = await c.post(f"{control_url}/api/v1/nodes/register",
-                         json=RegisterRequest(node_id=node_id, public_b64=ident.public_b64,
-                                              pool_ids=[pool]).model_dump(mode="json"))
+                         json=signed_body(ident, RegisterRequest(
+                             node_id=node_id, public_b64=ident.public_b64, pool_ids=[pool])))
         r.raise_for_status()
         print("registered:", r.json())
         r = await c.post(f"{control_url}/api/v1/nodes/{node_id}/capabilities",
@@ -103,8 +109,9 @@ async def main() -> None:
         r.raise_for_status()
         print("capability accepted:", r.json())
         r = await c.post(f"{control_url}/api/v1/nodes/{node_id}/heartbeat",
-                         json=HeartbeatRequest(node_id=node_id, free_vram_bytes=gpus * vram_each,
-                                              ram_free_bytes=64_000_000_000).model_dump(mode="json"))
+                         json=signed_body(ident, HeartbeatRequest(
+                             node_id=node_id, free_vram_bytes=gpus * vram_each,
+                             ram_free_bytes=int(node_cfg.get("ram_free_bytes", 64_000_000_000)))))
         r.raise_for_status()
         print("heartbeat ok")
 

@@ -58,15 +58,19 @@ Goal: make the swarm usable by other people.
 
 Deliverables:
 - account/auth,
-- curated public catalog,
-- public pools,
-- node installer,
-- contribution controls,
+- curated public catalog — **done for Phase 1 as versioned model channels**
+  (control plane re-scans, signs and publishes; nodes follow a channel, fetch
+  new versions peer-to-peer, swap engines, delete old files),
+- public pools — endpoints exist; membership/policy not yet,
+- node installer — **done** (`scripts/install.sh`, `scripts/install.ps1`; the
+  node self-installs the right `llama.cpp` build for Linux/macOS/Windows),
+- contribution controls — **done** (idle-awareness on all three OSes, CPU/VRAM/
+  RAM/storage caps, per-GPU selection),
 - basic dashboard,
-- OpenAI-compatible API,
-- credit ledger,
+- OpenAI-compatible API — **done** (single-node plans),
+- credit ledger — data model done; gossip replication pending,
 - node reputation,
-- work receipts.
+- work receipts — **done**, bound to issued plans and nonces.
 
 Exit criterion:
 - an external user can contribute a node and consume inference with earned credit.

@@ -103,3 +103,30 @@ def test_fork_choice_longest_valid(producer, worker):
     longer.append(Block.produce(identity=producer, index=2, prev_hash=longer.head_hash,
                                timestamp=TS + 20, entries=[_entry(_sr(worker, "r6", "n6", 5))]))
     assert pick_best_chain([short, longer]) is longer
+
+
+def test_positive_correction_rejected(producer, worker):
+    """Only receipt-backed verified work may MINT credit. A "correction" that adds
+    credit needs an authorization scheme Phase 1 does not have, so it is invalid."""
+    c = Chain.new(identity=producer, timestamp=TS)
+    bad = Block.produce(identity=producer, index=1, prev_hash=c.head_hash, timestamp=TS + 10,
+                        entries=[LedgerEntry(entry_id="fake", account=worker.node_id,
+                                             delta=1e9, reason="correction")])
+    with pytest.raises(ChainError, match="verified_work"):
+        c.append(bad)
+
+    # and it must not slip past a full re-verification either
+    c.blocks.append(bad)
+    with pytest.raises(ChainError, match="verified_work"):
+        c.verify_full()
+
+
+def test_negative_consumption_accepted(producer, worker):
+    c = Chain.new(identity=producer, timestamp=TS)
+    c.append(Block.produce(identity=producer, index=1, prev_hash=c.head_hash, timestamp=TS + 10,
+                           entries=[_entry(_sr(worker, "r1", "n1", 100))]))
+    c.append(Block.produce(identity=producer, index=2, prev_hash=c.head_hash, timestamp=TS + 20,
+                           entries=[LedgerEntry(entry_id="spend1", account=worker.node_id,
+                                                delta=-40.0, reason="consumption")]))
+    assert c.balances()[worker.node_id] == 60.0
+    c.verify_full()

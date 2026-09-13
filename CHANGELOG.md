@@ -4,6 +4,97 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This
 project does not yet use semantic version tags — `pyproject.toml` is pinned at
 `0.1.0` throughout Phase 1.
 
+## [Unreleased] — Phase 1 POC, audit pass 2 (2026-09-14)
+
+Correctness/security pass over the Phase-1 code plus the model-distribution
+feature set. Everything below is verified on the Linux host; Windows/macOS
+paths are implemented + unit-tested but not yet run on real machines.
+
+### Added
+
+- **Cross-platform install + engine.** `scripts/install.ps1` (Windows) beside
+  `scripts/install.sh`; `runtime_installer.py` now selects the upstream
+  `llama.cpp` prebuilt per OS/arch/accelerator (Linux CPU/Vulkan, macOS Metal,
+  Windows CUDA 12.4 + cudart bundle / CPU, zip or tar), verifies the binary
+  runs, and degrades down a cascade (`cuda-build` → `vulkan` → `cpu`) instead of
+  failing. The CUDA source build is opt-in (`--accel cuda-build`) and no longer
+  shells out to a dev-box-only tool. Metal gets `-ngl 999`; Vulkan multi-GPU
+  gets `GGML_VK_VISIBLE_DEVICES`.
+- **Cross-platform host signals** (`node/daemon/meshcompute_node/sysinfo.py`):
+  RAM total/available, free disk, user-idle seconds and AC-power on Linux, macOS
+  and Windows (stdlib only). Idle-only contribution now gates on real input
+  idle time on every OS instead of only X11.
+- **Model channels.** A catalog alias is a channel; the control plane re-scans
+  its manifest dir every 30 s, publishes a bumped `version` as the channel's
+  current manifest, refuses version regressions, and exposes `version` +
+  `size_bytes` on `/api/v1/models`. `GET /api/v1/models/{alias}` now works for
+  aliases containing `/` (it never did).
+- **Node model selection + organic updates** (`daemon.py`): `mesh node start
+  --model <alias>` or an interactive picker (remembered in
+  `~/.mesh/models/state.json`); `mesh node models` lists channels with sizes
+  and fit. A node polls its channel (`--update-poll`, default 300 s) and on a
+  new version downloads in the background, swaps the engine on the same fixed
+  port (`--port`, default 8099), deletes the superseded files, re-posts its
+  capability, and rolls back if the new engine fails to start.
+- **Peer-to-peer model distribution wired into the daemon.** Nodes announce
+  what they seed / want to the rendezvous tracker, dial seeders over QUIC, and
+  fetch every chunk BLAKE3-verified before touching Hugging Face; every node
+  seeds every file it holds. An update wave elects one **origin leader** per
+  file on the tracker (first node to want it); the others wait for it to seed
+  instead of all hitting Hugging Face — found live when two nodes both went to
+  origin for the same version twice in a row. Swarm wire protocol now has a per-stream
+  handshake, resumes by re-hashing chunks already on disk (no second chunk
+  cache — a 24 GB model costs 24 GB), and reports bytes served.
+- **Storage as a contribution.** `--max-storage` (default 100 GB) bounds cached
+  model files, refuses over-budget downloads, and is advertised as
+  `storage_share_bytes`. Orphaned model files from crashed runs are swept at
+  start.
+- `mesh manifest pin <yaml>` fills real `size_bytes` + BLAKE3
+  `artifact_root_hash` from local files; `public/smollm2-360m` is a new, fully
+  pinned CPU-friendly channel. `MESH_HOME` relocates a node's state.
+- Pools endpoints (`GET/POST /api/v1/pools`) the CLI already exposed.
+- Protocol (additive, `PROTOCOL_VERSION` unchanged): `RegisterRequest.signature_b64`,
+  `HeartbeatRequest.signature_b64` + `peer_rtt_ms`, `ScheduleRequest.executable_strategies`,
+  `RendezvousAnnounce.wanted_manifest_hashes`, `ModelView.version/size_bytes`.
+
+### Fixed (from a red-team pass; each has a regression test)
+
+- Anyone could re-register another node's id with their own key; node ids are
+  now derived from the key and registration is signed.
+- Heartbeats were unsigned: a dead node could be kept "online" and its free RAM
+  spoofed. Now signed with the registered key.
+- Work receipts were credited with no plan check and any nonce: 3 million
+  credits in three HTTP calls. Receipts now require a plan the scheduler issued,
+  membership in that plan, a nonce the control plane handed to that node, and
+  GPU time that fits the receipt's own window; credit uses the same formula the
+  on-chain ledger verifies (they disagreed).
+- Ledger: a `correction`/`consumption` entry could mint an arbitrary positive
+  balance; positive deltas now require a receipt-backed `verified_work` entry.
+- `mesh manifest sign/verify` signed the hash string while the control plane
+  signed the body; the CLI now uses the control plane's scheme and verifies both.
+- Scheduler offered a pipeline split even when the two nodes could not jointly
+  hold the model (the "infeasible" path was unreachable with 2+ nodes); tensor
+  and speculative plans ignored queue depth and node capabilities; node↔node
+  links were never populated so tensor/speculative plans could never be chosen
+  through the API. All four fixed; node RTTs come from measured QUIC pings.
+- Gateway: advertised multi-peer strategies it executed as single calls (now
+  501 for non-single plans), forwarded a model alias without checking the node
+  serves it (now 409 with the node's real model list; nodes start `llama-server
+  --alias <channel>`), turned control-plane 404s into 500s, masked control-plane
+  errors on `/v1/models`, never re-read `deploy/nodes.local.yaml`, kept sessions
+  forever (now capped at 500, `DELETE` added), and `mesh api serve --control-url`
+  set an env var the gateway didn't read.
+- `Frame.decode` enforced the payload cap only before decompression (zip bomb);
+  cap now applies to the decompressed size and is 64 MiB. Ping streams leaked
+  one QUIC stream per RTT sample; framing errors were dropped silently.
+- `LlamaCppBackend.start` raised `AttributeError` instead of the engine's real
+  exit code/log tail; health timeout raised to 10 min for 24 GB models.
+- Rendezvous `connect()` was never signed (always 400); relay websocket accepted
+  any session id with unbounded queues.
+- Docker Compose gateway had no route table mounted (no request could
+  complete); `scripts/register_external_backend.py` now signs and labels its
+  hardware figures as operator-declared.
+
 ## [Unreleased] — Phase 1 POC
 
 The core P2P distributed inference proof-of-concept: build, run, and measure.
@@ -100,11 +191,9 @@ The core P2P distributed inference proof-of-concept: build, run, and measure.
 
 ### Known limits (tracked, not silently missing)
 
-- `mesh node start` has no `--model` CLI flag yet; it always resolves the
-  CPU-friendly smoke model. The daemon's `model=` argument already supports
-  resolving any catalog alias — only the CLI wiring is missing.
-- No prebuilt Linux+CUDA `llama.cpp` release exists upstream; a CUDA node builds
-  from source on first run.
+- (superseded above) `mesh node start --model` and the model picker now exist.
+- No prebuilt Linux+CUDA `llama.cpp` release exists upstream; Linux+NVIDIA
+  uses the Vulkan prebuilt unless `--accel cuda-build` is given.
 - Multi-NAT hole-punching between two independently-NATed real hosts is
   implemented but untested at that scale; the relay fallback is a stub.
 - The `llama.cpp` RPC layer-split path (`--rpc`) is implemented in the backend

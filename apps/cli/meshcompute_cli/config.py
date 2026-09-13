@@ -30,11 +30,13 @@ def save_config(cfg: dict[str, Any]) -> None:
 
 
 def get_gateway_url(cfg: dict[str, Any] | None = None) -> str:
-    return os.environ.get("MESH_GATEWAY_URL") or (cfg or load_config()).get("gateway_url") or DEFAULT_GATEWAY_URL
+    cfg = cfg or load_config()
+    return os.environ.get("MESH_GATEWAY_URL") or cfg.get("gateway_url") or DEFAULT_GATEWAY_URL
 
 
 def get_control_url(cfg: dict[str, Any] | None = None) -> str:
-    return os.environ.get("MESH_CONTROL_URL") or (cfg or load_config()).get("control_url") or DEFAULT_CONTROL_URL
+    cfg = cfg or load_config()
+    return os.environ.get("MESH_CONTROL_URL") or cfg.get("control_url") or DEFAULT_CONTROL_URL
 
 
 def get_token(cfg: dict[str, Any] | None = None) -> str | None:

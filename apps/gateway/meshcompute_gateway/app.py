@@ -132,12 +132,26 @@ async def list_models():
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(f"{settings.mesh_gw_control_url}/api/v1/models")
-            resp.raise_for_status()
-            models = resp.json()
-    except httpx.HTTPError:
-        models = dev_model_catalog()  # dev/test fallback: control-plane not reachable
-    return {"object": "list",
-            "data": [{"id": m["id"], "object": "model", "owned_by": "meshcompute"} for m in models]}
+    except httpx.TransportError:
+        # ONLY an unreachable control-plane may fall back; a control-plane that
+        # answered with an error is a real answer and must not be papered over.
+        models = dev_model_catalog()
+    else:
+        if resp.status_code >= 400:
+            raise HTTPException(
+                status_code=502,
+                detail=f"control-plane /api/v1/models returned {resp.status_code}: {resp.text}")
+        models = resp.json()
+    data = []
+    for m in models:
+        # version/size_bytes are extra keys on top of the OpenAI model object
+        # (harmless for OpenAI clients, useful for mesh-aware ones).
+        entry = {"id": m["id"], "object": "model", "owned_by": "meshcompute"}
+        for extra in ("version", "size_bytes"):
+            if m.get(extra) is not None:
+                entry[extra] = m[extra]
+        data.append(entry)
+    return {"object": "list", "data": data}
 
 
 class ChatCompletionRequest(BaseModel):
@@ -153,6 +167,9 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: float | None = None
     stop: list[str] | str | None = None
     tools: list[dict] | None = None
+    # Accepted-but-unused: harness selection is Phase 2.5. Declared so the CLI's
+    # `--harness` isn't silently dropped by pydantic before it means anything.
+    harness: str | None = None
 
 
 @app.post("/v1/chat/completions")
@@ -162,7 +179,7 @@ async def chat_completions(body: ChatCompletionRequest):
             model_id=body.model, client_node_id="client", ctx=0,
             prompt_tokens=_estimate_prompt_tokens(body.messages))
     except SchedulerUnavailable as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise HTTPException(status_code=e.status_code, detail=str(e))
 
     headers = _mesh_headers(plan)
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -205,6 +222,9 @@ async def chat_completions(body: ChatCompletionRequest):
 _sessions: dict[str, dict] = {}
 _events: dict[str, list[dict]] = {}
 _cancel_events: dict[str, asyncio.Event] = {}
+# ponytail: hard cap + oldest-first eviction so an in-memory store can't grow
+# unbounded. Swap for a real TTL/persistence when sessions outlive a process.
+MAX_SESSIONS = 500
 
 
 class CreateSessionRequest(BaseModel):
@@ -234,6 +254,12 @@ def _session_messages(session_id: str) -> list[dict]:
             for e in _events[session_id] if e["content_type"].endswith("_message")]
 
 
+def _forget_session(session_id: str) -> None:
+    _sessions.pop(session_id, None)
+    _events.pop(session_id, None)
+    _cancel_events.pop(session_id, None)
+
+
 def _get_session_or_404(session_id: str) -> dict:
     session = _sessions.get(session_id)
     if session is None:
@@ -243,6 +269,9 @@ def _get_session_or_404(session_id: str) -> dict:
 
 @app.post("/api/v1/sessions")
 async def create_session(body: CreateSessionRequest):
+    while len(_sessions) >= MAX_SESSIONS:
+        oldest = min(_sessions, key=lambda sid: _sessions[sid]["created_at"])
+        _forget_session(oldest)
     session_id = f"sess_{uuid.uuid4().hex[:16]}"
     session = {"session_id": session_id, "model_id": body.model_id, "harness_id": body.harness_id,
               "pool_id": body.pool_id, "tools": body.tools, "memory_mode": body.memory_mode,
@@ -257,6 +286,13 @@ async def get_session(session_id: str):
     return _get_session_or_404(session_id)
 
 
+@app.delete("/api/v1/sessions/{session_id}")
+async def delete_session(session_id: str):
+    _get_session_or_404(session_id)
+    _forget_session(session_id)
+    return {"ok": True, "session_id": session_id, "status": "deleted"}
+
+
 @app.post("/api/v1/sessions/{session_id}/messages")
 async def post_session_message(session_id: str, body: SessionMessageRequest):
     session = _get_session_or_404(session_id)
@@ -268,7 +304,7 @@ async def post_session_message(session_id: str, body: SessionMessageRequest):
             model_id=session["model_id"], client_node_id="client", ctx=0,
             prompt_tokens=_estimate_prompt_tokens(messages))
     except SchedulerUnavailable as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise HTTPException(status_code=e.status_code, detail=str(e))
 
     headers = _mesh_headers(plan)
     req = _build_backend_request(model=session["model_id"], messages=messages, stream=True)

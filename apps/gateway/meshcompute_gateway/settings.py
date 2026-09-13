@@ -50,13 +50,22 @@ class NodeEndpoint:
     backend: str = "lmstudio"
 
 
-@lru_cache
+# Cached by (path, mtime) rather than @lru_cache: an operator editing
+# deploy/nodes.local.yaml (adding a worker) must take effect without restarting
+# the gateway. Re-reads only when the file's mtime moves.
+_endpoint_cache: dict[tuple[str, float], dict[str, NodeEndpoint]] = {}
+
+
 def load_node_endpoints() -> dict[str, NodeEndpoint]:
     """node_id -> NodeEndpoint from deploy/nodes.local.yaml. Empty dict if the file
     is absent (e.g. before an operator has configured deploy, or in CI)."""
     path = _resolve(get_settings().nodes_local_file)
     if not path.exists():
         return {}
+    cache_key = (str(path), path.stat().st_mtime)
+    cached = _endpoint_cache.get(cache_key)
+    if cached is not None:
+        return cached
     data = yaml.safe_load(path.read_text()) or {}
     out: dict[str, NodeEndpoint] = {}
     for n in data.get("nodes", []):
@@ -66,7 +75,16 @@ def load_node_endpoints() -> dict[str, NodeEndpoint]:
             continue
         out[node_id] = NodeEndpoint(node_id=node_id, backend_url=backend_url,
                                      backend=n.get("backend", "lmstudio"))
+    _endpoint_cache[cache_key] = out
     return out
+
+
+def _clear_endpoint_cache() -> None:
+    _endpoint_cache.clear()
+
+
+# kept so callers (and tests) written against the old @lru_cache still work
+load_node_endpoints.cache_clear = _clear_endpoint_cache
 
 
 def dev_model_catalog() -> list[dict]:

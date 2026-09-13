@@ -70,7 +70,22 @@ raises concurrent capacity — verified in `tests/scheduler`.
 | App-level RTT (PING/PONG) | 0.55 ms (loopback) |
 | Swarm: 5.25 MB file seed→leech | BLAKE3 root matched; every chunk verified |
 | Corrupt chunk in transit | rejected (`ChunkVerifyError`), refetched |
-| Resume from partial (3/6 chunks) | cached chunks not re-fetched; final digest matched |
+| Resume from partial (3/7 chunks, 1 rotted on disk) | 2 intact kept, 5 re-fetched; final digest matched |
+
+## Two live nodes on one box: peer-to-peer model fetch + channel update (2026-09-14)
+
+Control plane + two `mesh node start` daemons (`MESH_HOME` separates them),
+channel `public/smollm2-360m` (258 MiB GGUF, 259 × 1 MiB chunks).
+
+| Step | Observed |
+|---|---|
+| Node 1 joins | no seeder yet → Hugging Face origin; registers; announces seeding |
+| Node 2 joins | `fetching ... from peer nd_633c06ee5 @ <lan>:40494 (rtt 1.54 ms)` → `259/259 chunks` → `obtained from peers (verified)` — Hugging Face never contacted |
+| Peer transfer rate | ~10 MiB/s, single QUIC stream, pure-Python `aioquic` (CPU-bound, not disk-bound). Phase-1.5: parallel streams / larger chunks |
+| Both nodes advertised | `online`, `storage_share_bytes` = min(--max-storage, free disk) |
+| Channel push (v1→v2, v2→v3, v3→v4) | control plane re-scanned the manifest dir and published each within 30 s; both nodes downloaded, swapped engines on the same port, deleted the old file (`now serving vN; deleted 1 old file(s)`) — but in all three waves **both** nodes fetched from Hugging Face: they polled inside the same window and neither held the new file yet. That is the bug the origin-leader election fixes |
+| Channel push v4→v5 (with origin-leader election) | node 2 polled first: `no peer is seeding ... fetching it from origin for the network`. node 1: `peer nd_e7e236db2 is already fetching ... waiting to get it from that peer instead` → `259/259 chunks` → `obtained from peers (verified)` → `now serving v5; deleted 1 old file(s)`. One origin download for the wave; the rest peer-to-peer |
+| Gateway → scheduler → live node | `POST /v1/chat/completions` through the gateway: reply `'Pong.'`, `x-mesh-strategy: single`, `x-mesh-path: <node 1>`; unknown model → 404; unsigned node registration → 400 |
 
 ## Not yet benchmarked (needs hardware/access)
 

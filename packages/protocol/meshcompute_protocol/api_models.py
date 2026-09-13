@@ -33,9 +33,13 @@ from .versioning import PROTOCOL_VERSION
 
 class RegisterRequest(BaseModel):
     protocol_version: int = PROTOCOL_VERSION
-    node_id: str
+    node_id: str                        # MUST equal node_id_from_public(public_b64)
     public_b64: str
     pool_ids: list[str] = Field(default_factory=lambda: ["public"])
+    # proof of key possession: sign(canonical_json of the body minus this field).
+    # Additive (older clients send ""); the control plane rejects unsigned
+    # registrations, so no one can bind a foreign key to an existing node_id.
+    signature_b64: str = ""
 
 
 class RegisterResponse(BaseModel):
@@ -53,6 +57,13 @@ class HeartbeatRequest(BaseModel):
     queue_depth: int = 0
     active_sessions: int = 0
     cached_manifest_hashes: list[str] = Field(default_factory=list)
+    # measured RTT (ms) from this node to peers it has actually talked to over
+    # QUIC — feeds node<->node edges of the topology graph (additive field)
+    peer_rtt_ms: dict[str, float] = Field(default_factory=dict)
+    # sign(canonical_json of the body minus this field) with the registered key;
+    # unsigned heartbeats are rejected so nobody can keep a dead node "online"
+    # or spoof its free RAM (additive field)
+    signature_b64: str = ""
 
 
 class HeartbeatResponse(BaseModel):
@@ -70,11 +81,13 @@ class NodeView(BaseModel):
 
 
 class ModelView(BaseModel):
-    id: str                             # platform alias
+    id: str                             # platform alias == the model CHANNEL
     manifest_hash: str
     display_name: str = ""
     context_length: int = 0
     signed: bool = False
+    version: int = 1                    # channel version; nodes swap when it advances
+    size_bytes: int = 0                 # recommended (first-listed) quantization, all files
 
 
 class ScheduleRequest(BaseModel):
@@ -87,6 +100,10 @@ class ScheduleRequest(BaseModel):
     gen_tokens: int = 256
     priority: int = 0
     user_id: str = "anon"
+    # strategies the CALLER can actually execute; the scheduler only proposes
+    # plans from this set. The Phase-1 gateway drives one OpenAI-compatible
+    # backend per request, so it sends ["single"]. Empty = no restriction.
+    executable_strategies: list[str] = Field(default_factory=list)
 
 
 # --- rendezvous (public tracker; BitTorrent-like peer introduction) ----------
@@ -100,6 +117,9 @@ class RendezvousAnnounce(BaseModel):
     nat_type: str = "unknown"
     # content the node can seed (manifest/chunk availability for the swarm)
     seeding_manifest_hashes: list[str] = Field(default_factory=list)
+    # content the node is looking for: the tracker returns peers seeding these
+    # too (additive field, protocol_version unchanged; older peers send [])
+    wanted_manifest_hashes: list[str] = Field(default_factory=list)
     signature_b64: str = ""             # sign(canonical_json of the above minus this)
 
 
@@ -111,12 +131,21 @@ class PeerCandidate(BaseModel):
     quic_port: int = 0
     nat_type: str = "unknown"
     relay_addr: str | None = None
+    # "seeder": holds content you asked about; "leecher": is fetching the same
+    # content right now (so it will seed it soon — wait for it instead of all
+    # racing to origin). Additive field; older trackers only ever send seeders.
+    role: str = "seeder"
 
 
 class RendezvousPeers(BaseModel):
     ok: bool
     peers: list[PeerCandidate] = Field(default_factory=list)
     your_reflexive_addr: str | None = None   # server-observed source addr (STUN-like)
+    # For the announcer's wanted content with no seeder yet: which node should
+    # fetch it from origin (the one that started wanting it first, on the
+    # tracker's clock; ties by node_id). Everyone else waits for that node to
+    # seed. None when a seeder exists or nothing was wanted. Additive field.
+    origin_leader: str | None = None
 
 
 class ConnectRequest(BaseModel):

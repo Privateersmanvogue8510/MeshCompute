@@ -21,7 +21,7 @@ from typing import AsyncIterator
 from .base import BackendAdapter, BackendCapabilities, ChatRequest, TokenChunk
 from .lmstudio import OpenAICompatBackend
 
-DEFAULT_LOG_DIR = Path.home() / ".mesh" / "logs"
+DEFAULT_LOG_DIR = Path(os.environ.get("MESH_HOME") or (Path.home() / ".mesh")) / "logs"
 
 
 def _free_port() -> int:
@@ -32,7 +32,7 @@ def _free_port() -> int:
 
 def gpu_launch_args(selected_gpus: list[dict], *, split_mode: str = "layer",
                      tensor_split: str | None = None,
-                     main_gpu: int = 0) -> tuple[dict[str, str], list[str]]:
+                     main_gpu: int = 0, accel: str = "cuda") -> tuple[dict[str, str], list[str]]:
     """Pure helper (no subprocess, no I/O — unit-testable with zero GPUs
     present): given the GPUs a contributor selected to donate, return
     (env, args) to launch llama-server across exactly those cards.
@@ -58,11 +58,19 @@ def gpu_launch_args(selected_gpus: list[dict], *, split_mode: str = "layer",
     behavior are untestable on this CPU-only box; this only proves the
     argument-building logic, not runtime behavior on real hardware.
     """
+    if accel == "metal":
+        # Apple Silicon: unified memory, one device — offload everything.
+        return {}, ["-ngl", "999"]
     if not selected_gpus:
         return {}, []
 
     indices = [str(g["index"]) for g in selected_gpus]
     env = {"CUDA_VISIBLE_DEVICES": ",".join(indices)}
+    if accel == "vulkan":
+        # Linux+NVIDIA without a CUDA build runs the Vulkan backend; its device
+        # filter is GGML_VK_VISIBLE_DEVICES (indices in Vulkan's enumeration
+        # order, which matches nvidia-smi order on single-vendor boxes).
+        env["GGML_VK_VISIBLE_DEVICES"] = env["CUDA_VISIBLE_DEVICES"]
     args = ["-ngl", "999"]
 
     if len(selected_gpus) > 1:
@@ -125,8 +133,10 @@ class LlamaCppBackend(BackendAdapter):
         argv += self.extra_args
         return argv
 
-    async def start(self, *, health_timeout: float = 120.0) -> None:
-        """Launch the child process and wait until it answers /v1/models."""
+    async def start(self, *, health_timeout: float = 600.0) -> None:
+        """Launch the child process and wait until it answers /v1/models.
+        Default timeout is generous: a 24 GB GGUF can take minutes to page in
+        from a cold disk."""
         self._log_file = open(self.log_path, "wb")
         env = {**os.environ, **self.extra_env} if self.extra_env else None
         self._proc = subprocess.Popen(self._argv(), stdout=self._log_file,
@@ -134,17 +144,20 @@ class LlamaCppBackend(BackendAdapter):
         deadline = time.monotonic() + health_timeout
         while time.monotonic() < deadline:
             if self._proc.poll() is not None:
+                code = self._proc.returncode
                 tail = self.log_path.read_text(errors="replace")[-4000:]
                 self.stop()
-                raise RuntimeError(
-                    f"llama-server exited early (code {self._proc.returncode}); "
-                    f"log tail:\n{tail}")
+                raise RuntimeError(f"llama-server exited early (code {code}); log tail:\n{tail}")
             if await self._openai.health():
                 return
             await asyncio.sleep(0.5)
         self.stop()
         raise TimeoutError(f"llama-server did not become healthy within {health_timeout}s "
                             f"(see {self.log_path})")
+
+    @property
+    def running(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
 
     def stop(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
@@ -183,7 +196,9 @@ class LlamaCppBackend(BackendAdapter):
 if __name__ == "__main__":
     import asyncio as _asyncio
 
-    from meshcompute_runtime.runtime_installer import SMOKE_MODEL, detect_accel, ensure_llama_server, ensure_model
+    from meshcompute_runtime.runtime_installer import (
+        SMOKE_MODEL, detect_accel, ensure_llama_server, ensure_model,
+    )
 
     # --- gpu_launch_args: pure arg-builder proof, no GPU required ---
     cpu_env, cpu_args = gpu_launch_args([])
@@ -212,17 +227,20 @@ if __name__ == "__main__":
     assert args_row[args_row.index("--split-mode") + 1] == "row"
     assert args_row[args_row.index("--tensor-split") + 1] == "1,1"
 
+    assert gpu_launch_args([], accel="metal") == ({}, ["-ngl", "999"]), "Metal must offload"
+    env_vk, _ = gpu_launch_args(one_gpu, accel="vulkan")
+    assert env_vk["GGML_VK_VISIBLE_DEVICES"] == "0" and env_vk["CUDA_VISIBLE_DEVICES"] == "0"
+
     print(f"single-GPU launch: env={env1} args={args1}")
     print(f"gpu_devices=[1] launch: env={env_gpu1_only} args={args_gpu1_only}")
     print(f"CPU launch: env={cpu_env} args={cpu_args}")
     print("gpu_launch_args self-check PASSED")
 
     async def _demo() -> None:
-        accel = detect_accel()
-        server_bin = await ensure_llama_server(accel=accel)
-        model_path = await ensure_model(SMOKE_MODEL)
-        backend = LlamaCppBackend(server_bin, model_path, ctx_size=2048,
-                                   n_gpu_layers=999 if accel == "cuda" else 0)
+        engine = await ensure_llama_server(accel=detect_accel())
+        model_path, _target = await ensure_model(SMOKE_MODEL)
+        _env, gargs = gpu_launch_args([], accel=engine.accel)
+        backend = LlamaCppBackend(engine.path, model_path, ctx_size=2048, extra_args=gargs)
         print(f"starting llama-server on {backend.base_url} (log: {backend.log_path})")
         await backend.start()
         assert await backend.health()

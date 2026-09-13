@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime
+import logging
 import ssl
 import struct
 import time
@@ -34,7 +35,7 @@ from aioquic.asyncio.server import QuicServer
 from aioquic.quic import events as quic_events
 from aioquic.quic.configuration import QuicConfiguration
 
-from meshcompute_protocol import Frame, PacketClass
+from meshcompute_protocol import MAX_PAYLOAD, Frame, PacketClass
 
 try:
     from .transport_base import PeerAddress, PeerConnection, Stream, Transport
@@ -43,7 +44,7 @@ except ImportError:  # running as a plain script (python path/to/transport_quic.
 
 ALPN = "meshcompute/1"
 _LEN = struct.Struct(">I")
-_MAX_FRAME_ON_WIRE = (256 << 20) + 4096  # Frame.MAX_PAYLOAD + header slack
+_MAX_FRAME_ON_WIRE = MAX_PAYLOAD + 4096  # Frame.MAX_PAYLOAD + header slack
 _LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
 
 
@@ -126,6 +127,8 @@ class QuicStream(Stream):
             self._writer.write_eof()
         with contextlib.suppress(Exception):
             await self._writer.drain()
+        with contextlib.suppress(Exception):
+            self._writer.close()
 
 
 class _MeshProtocol(QuicConnectionProtocol):
@@ -161,12 +164,22 @@ class _MeshProtocol(QuicConnectionProtocol):
     async def _dispatch_stream(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             frame = await _read_frame(reader)
-        except (EOFError, ValueError):
+        except (EOFError, ValueError) as exc:
+            # a CRC mismatch, bad protocol version or oversized length prefix must
+            # not vanish silently — that is exactly how corruption goes unnoticed.
+            logging.getLogger("meshcompute_node.transport").warning(
+                "dropping inbound stream: %s", exc)
+            with contextlib.suppress(Exception):
+                writer.close()
             return
         if frame.packet_class == PacketClass.CONTROL and frame.payload == b"PING":
             pong = Frame(packet_class=PacketClass.CONTROL, request_id=frame.request_id, payload=b"PONG")
             with contextlib.suppress(Exception):
                 await _write_frame(writer, pong)
+            # end our side too: an unfinished stream is never reaped, so without
+            # this we leak one QUIC stream per RTT sample, forever.
+            with contextlib.suppress(Exception):
+                writer.write_eof()
             return
         self.inbound_streams.put_nowait(QuicStream(reader, writer, preloaded=frame))
 
@@ -199,6 +212,12 @@ class QuicPeerConnection(PeerConnection):
             return await asyncio.wait_for(coro, timeout)
         except asyncio.TimeoutError:
             raise TimeoutError("no inbound stream within timeout") from None
+
+    async def wait_closed(self) -> None:
+        """Resolves when the underlying QUIC connection is gone (peer closed,
+        idle timeout, or we closed it) — lets a serving loop stop waiting on
+        accept_stream() for a dead peer."""
+        await self._protocol.wait_closed()
 
     async def rtt_ms(self) -> float:
         stream = await self.open_stream()
@@ -303,7 +322,7 @@ class QuicTransport(Transport):
         which is explicitly out of scope for this pass. Relay tunneling
         (GET /api/v1/rendezvous/relay/{session}) is likewise not implemented yet.
         """
-        ticket = await self._rendezvous.connect(self._identity.node_id, addr.node_id)
+        ticket = await self._rendezvous.connect(self._identity, addr.node_id)
         if ticket.peer and ticket.peer.reflexive_addr:
             host, port_s = ticket.peer.reflexive_addr.rsplit(":", 1)
             punch_addr = PeerAddress(node_id=addr.node_id, host=host, port=int(port_s),

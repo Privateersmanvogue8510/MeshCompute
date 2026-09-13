@@ -100,3 +100,89 @@ def test_pipeline_not_proposed_with_a_single_node(manifest_factory, node_factory
 
     assert plan.strategy == Strategy.SINGLE
     assert not any("pipeline" in line.lower() for line in plan.decision_trace)
+
+
+LAN = dict(rtt_ms=1, throughput_mbps=10000, path_type="direct")
+POD_KW = dict(vram_bytes=24_000_000_000, free_vram_bytes=24_000_000_000,
+              decode_tps=50, prefill_tps=400)
+
+
+def _lan_graph(node_ids):
+    """Every pair (and the client) on a LAN-class link, in BOTH directions —
+    the precondition _mutually_lan_class() checks for a tensor pod."""
+    graph = TopologyGraph()
+    for i, a in enumerate([CLIENT, *node_ids]):
+        for b in [CLIENT, *node_ids][i + 1:]:
+            graph.set_link(a, b, LinkMetrics(**LAN))
+            graph.set_link(b, a, LinkMetrics(**LAN))
+    return graph
+
+
+def test_executable_strategies_limits_candidates(manifest_factory, node_factory):
+    """The caller says what it can actually run (the Phase-1 gateway drives one
+    OpenAI-compatible backend, so it sends ["single"]). A plan the caller cannot
+    execute is worse than no plan, so those strategies must never be proposed."""
+    manifest = manifest_factory(size_bytes=1_000_000_000)
+    nodes = {nid: node_factory(nid, strategies=("single", "replica", "tensor"), **POD_KW)
+             for nid in ("nd_a", "nd_b")}
+
+    plan = Scheduler().plan(model=manifest, nodes=nodes, graph=_lan_graph(list(nodes)),
+                            client_node_id=CLIENT, context_length=4096,
+                            executable_strategies=["single"])
+
+    assert plan.strategy == Strategy.SINGLE
+    assert any("tensor: not executable by caller" in r for r in plan.rejected_alternatives)
+
+
+def test_pipeline_rejected_when_chain_cannot_hold_the_model(manifest_factory, node_factory):
+    """Two 8GB nodes do not add up to a 500GB model: splitting layers only works
+    if the chain JOINTLY holds weights + KV, otherwise it is still infeasible."""
+    manifest = manifest_factory(size_bytes=500_000_000_000, context=4096)
+    nodes = {nid: node_factory(nid, vram_bytes=8_000_000_000, free_vram_bytes=8_000_000_000,
+                               ram_free_bytes=8_000_000_000, decode_tps=50)
+             for nid in ("nd_tiny_a", "nd_tiny_b")}
+
+    with pytest.raises(ValueError, match="infeasible") as exc:
+        Scheduler().plan(model=manifest, nodes=nodes, graph=TopologyGraph(),
+                         client_node_id=CLIENT, context_length=4096)
+    assert "combined memory" in str(exc.value)
+
+
+def test_tensor_pod_requires_advertised_tensor_strategy(manifest_factory, node_factory):
+    """A node that never advertised "tensor" cannot be drafted into a tensor pod —
+    the scheduler must respect CapabilityRecord.strategies, not just the topology."""
+    manifest = manifest_factory(size_bytes=1_000_000_000)
+
+    def pod(strategies):
+        return {nid: node_factory(nid, strategies=strategies, **POD_KW)
+                for nid in ("nd_a", "nd_b")}
+
+    graph = _lan_graph(["nd_a", "nd_b"])
+    without = Scheduler().plan(model=manifest, nodes=pod(("single", "replica")), graph=graph,
+                               client_node_id=CLIENT, context_length=4096)
+    assert without.strategy != Strategy.TENSOR
+    assert not any("tensor" in line for line in without.decision_trace)
+
+    with_tensor = Scheduler().plan(model=manifest, nodes=pod(("single", "replica", "tensor")),
+                                   graph=graph, client_node_id=CLIENT, context_length=4096)
+    assert with_tensor.strategy == Strategy.TENSOR
+    assert with_tensor.peer_chain == ["nd_a", "nd_b"]
+
+
+def test_tensor_pod_score_includes_queue_wait(manifest_factory, node_factory):
+    """A fast pod that 50 requests are already queued on is NOT the fast option.
+    Tensor/speculative must pay the same queue-wait term SINGLE does, or the
+    scheduler sends everyone to the same busy pod."""
+    manifest = manifest_factory(size_bytes=1_000_000_000)
+    nodes = {nid: node_factory(nid, strategies=("single", "replica", "tensor"), **POD_KW)
+             for nid in ("nd_pod_a", "nd_pod_b", "nd_idle_far")}
+
+    graph = _lan_graph(["nd_pod_a", "nd_pod_b"])
+    graph.set_link(CLIENT, "nd_idle_far", LinkMetrics(rtt_ms=200, throughput_mbps=200))
+
+    plan = Scheduler().plan(model=manifest, nodes=nodes, graph=graph, client_node_id=CLIENT,
+                            context_length=4096,
+                            load={"nd_pod_a": 50, "nd_pod_b": 50, "nd_idle_far": 0})
+
+    assert plan.strategy == Strategy.SINGLE
+    assert plan.peer_chain == ["nd_idle_far"]

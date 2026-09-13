@@ -1,0 +1,59 @@
+# MeshCompute public model channel: a tiny CPU-friendly model every node can
+# run. Exists so a contributor with no GPU can join, so onboarding takes
+# seconds, and so the peer-to-peer distribution + channel-update path can be
+# exercised end to end on any machine. Not a capability target.
+#
+# artifact_root_hash / size_bytes are REAL, pinned from the file
+# (`mesh manifest pin` — BLAKE3 over the whole GGUF). Bump `version` and change
+# the file entry to push an update to every node following this channel.
+protocol_version: 1
+id: public/smollm2-360m
+version: 1
+display_name: "SmolLM2 360M Instruct (CPU smoke channel)"
+architecture: llama
+context_length_max: 8192
+context_length_configured: 4096
+
+upstream:
+  provider: HuggingFaceTB
+  repository: bartowski/SmolLM2-360M-Instruct-GGUF
+  revision: main
+
+license:
+  id: Apache-2.0
+
+runtime:
+  min_meshcompute: 0.1.0
+  backends: [llamacpp, lmstudio]
+  required_backend_capabilities: [gguf]
+
+tokenizer:
+  revision: main
+
+chat_template:
+  revision: main
+
+quantizations:
+  - id: Q4_K_M
+    notes: "default; 258 MiB"
+    files:
+      - rfilename: SmolLM2-360M-Instruct-Q4_K_M.gguf
+        size_bytes: 270590880
+        artifact_root_hash: "6cb0ba7f2d5e00ad4445c162c9e7e3f2d2e620f10656b86b1df1f6b1797e509d"
+        chunk_bytes: 1048576
+
+parallelism:
+  pipeline: false
+  tensor: "no"
+  expert: "no"
+  speculative_draft: true      # small enough to serve as a draft peer later
+  replica: true
+
+sampling_defaults:
+  temperature: 0.2
+  top_p: 0.95
+  top_k: 40
+
+safety_notes: >
+  Small general-purpose instruct model. PUBLIC-POOL PRIVACY: an inference worker
+  can observe prompt-derived state — recommend a private pool for sensitive data.

@@ -44,6 +44,10 @@ __pycache__/
 dist/
 build/
 
+# Agent scratch (memory file is kept; backups/tmp are not)
+.agent/backups/
+.agent/tmp/
+
 # Editor / OS
 .vscode/
 .idea/

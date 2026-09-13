@@ -75,6 +75,12 @@ class Store:
                     plan TEXT NOT NULL,
                     created REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS pools (
+                    pool_id TEXT PRIMARY KEY,
+                    private INTEGER NOT NULL DEFAULT 0,
+                    created REAL NOT NULL
+                );
+                INSERT OR IGNORE INTO pools (pool_id, private, created) VALUES ('public', 0, 0);
                 """
             )
 
@@ -217,6 +223,22 @@ class Store:
         return json.loads(row["plan"]) if row else None
 
 
+    # --- pools ----------------------------------------------------------------------
+    def list_pools(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute("SELECT pool_id, private FROM pools ORDER BY created").fetchall()
+        return [{"id": r["pool_id"], "private": bool(r["private"])} for r in rows]
+
+    def create_pool(self, pool_id: str, private: bool, created: float) -> bool:
+        try:
+            with self._lock, self._conn:
+                self._conn.execute("INSERT INTO pools (pool_id, private, created) VALUES (?, ?, ?)",
+                                   (pool_id, int(private), created))
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
 def _node_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "node_id": row["node_id"],
@@ -259,6 +281,8 @@ def _demo() -> None:
 
         s.put_session("sess1", {"plan_id": "plan1"}, 5.0)
         assert s.get_session("sess1")["plan_id"] == "plan1"
+        assert s.list_pools() == [{"id": "public", "private": False}]
+        assert s.create_pool("studio", True, 6.0) and not s.create_pool("studio", True, 7.0)
     print("store.py self-check OK")
 
 

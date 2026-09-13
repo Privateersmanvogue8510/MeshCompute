@@ -13,8 +13,11 @@
 # Usage:
 #   docker compose -f infra/compose/docker-compose.yml up -d
 #
-# Real deploy config (deploy/nodes.local.yaml) is never baked into the image —
-# uncomment the mounts below and point them at your own gitignored local file.
+# Real deploy config (deploy/nodes.local.yaml) is never baked into the image.
+# The gateway NEEDS it (it maps a scheduled node_id to that node's backend_url),
+# so before `up`:  cp deploy/nodes.example.yaml deploy/nodes.local.yaml  and
+# fill in your nodes. Model channel updates: edit models/manifests/*.yaml on
+# the host; the control plane re-scans the mounted dir every 30 s.
 
 services:
   control-plane:
@@ -31,7 +34,7 @@ services:
     volumes:
       - ../../models/manifests:/app/models/manifests:ro
       - control-plane-var:/app/var
-      # - ../nodes.local.yaml:/app/deploy/nodes.local.yaml:ro
+      - ../nodes.local.yaml:/app/deploy/nodes.local.yaml:ro
     restart: unless-stopped
 
   gateway:
@@ -44,9 +47,10 @@ services:
       - "8081:8081"
     environment:
       MESH_GW_CONTROL_URL: "http://control-plane:8080"
+      NODES_LOCAL_FILE: /app/deploy/nodes.local.yaml
     volumes:
       - ../../models/manifests:/app/models/manifests:ro
-      # - ../nodes.local.yaml:/app/deploy/nodes.local.yaml:ro
+      - ../nodes.local.yaml:/app/deploy/nodes.local.yaml:ro
     depends_on:
       - control-plane
     restart: unless-stopped

@@ -4,7 +4,7 @@ Large tensor payloads must NOT go through JSON. This defines a compact, versione
 binary header for activation / KV / token packets. The header is fixed-layout; the
 payload follows. Compression is optional and benchmark-driven (never assumed to help).
 
-Header layout (big-endian), 40 bytes fixed + variable shape:
+Header layout (big-endian), 32 bytes fixed + variable shape:
   u8   protocol_version
   u8   packet_class     (see PacketClass)
   u8   dtype            (see Dtype)
@@ -19,6 +19,11 @@ Header layout (big-endian), 40 bytes fixed + variable shape:
   u16  payload_crc16    (of payload for corruption detection)
   u32  payload_length
   u32[ndim] shape
+
+NOTE: `session_id` is NOT carried on the wire — only its CRC32 (session_id_crc),
+which is enough for fast routing/validation against a session the receiver already
+knows. decode() therefore leaves Frame.session_id empty and exposes the received
+crc as Frame._sid_crc; compare it, don't expect the string to survive a roundtrip.
 """
 
 from __future__ import annotations
@@ -58,7 +63,11 @@ class Compression(IntEnum):
 
 _FIXED = struct.Struct(">BBBB I Q I H H B B H I")  # 32 bytes before shape
 MAX_NDIM = 8
-MAX_PAYLOAD = 256 * 1024 * 1024  # 256 MiB hard cap (backpressure / DoS bound)
+# 64 MiB hard cap (backpressure / DoS bound), enforced on the COMPRESSED bytes at
+# encode and on the DECOMPRESSED bytes at decode (a zip bomb is a few KB on the
+# wire). Real traffic is far under it: per-token activations for a 27B model are
+# ~10 KB, and a prefill micro-batch is orders of magnitude below 64 MiB.
+MAX_PAYLOAD = 64 * 1024 * 1024
 
 
 @dataclass
@@ -114,7 +123,12 @@ class Frame:
         if (zlib.crc32(payload) & 0xFFFF) != pcrc:
             raise ValueError("payload crc mismatch (corruption)")
         if comp == Compression.ZLIB:
-            payload = zlib.decompress(payload)
+            # decompress with a bound: a small compressed payload can expand past
+            # the cap (zip bomb), so never hand zlib an unbounded output buffer.
+            d = zlib.decompressobj()
+            payload = d.decompress(payload, MAX_PAYLOAD + 1)
+            if len(payload) > MAX_PAYLOAD or d.unconsumed_tail:
+                raise ValueError("decompressed payload exceeds cap")
         f = cls(packet_class=PacketClass(pc), request_id=rid, step=step, microbatch=mb,
                 tensor_id=tid, dtype=Dtype(dt), shape=tuple(shape), payload=payload,
                 compression=Compression.NONE, protocol_version=pv)

@@ -81,5 +81,16 @@ def test_wrong_protocol_version_raises_value_error():
         Frame.decode(bytes(encoded))
 
 
-def test_max_payload_constant_is_256_mib():
-    assert MAX_PAYLOAD == 256 * 1024 * 1024
+def test_zlib_bomb_over_max_decompressed_raises_value_error(monkeypatch):
+    """A few hundred compressed bytes can expand past the cap. The cap must be
+    enforced on the DECOMPRESSED size too, not just what arrived on the wire."""
+    encoded = _frame(payload=b"A" * 100_000, compression=Compression.ZLIB).encode()
+    monkeypatch.setattr(frames_mod, "MAX_PAYLOAD", 4096)
+    assert len(encoded) < 4096  # small on the wire...
+
+    with pytest.raises(ValueError, match="decompressed payload exceeds cap"):
+        Frame.decode(encoded)  # ...but 100kB once inflated
+
+
+def test_max_payload_constant_is_64_mib():
+    assert MAX_PAYLOAD == 64 * 1024 * 1024

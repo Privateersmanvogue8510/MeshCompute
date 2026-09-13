@@ -32,8 +32,10 @@ class RendezvousClient:
         quic_port: int,
         nat_type: str = "unknown",
         seeding_hashes: list[str] | None = None,
+        wanted_hashes: list[str] | None = None,
     ) -> RendezvousPeers:
-        """Sign and POST a RendezvousAnnounce; return the peers the tracker knows."""
+        """Sign and POST a RendezvousAnnounce; return the peers seeding content
+        we seed or want (BitTorrent-tracker style)."""
         announce = RendezvousAnnounce(
             node_id=identity.node_id,
             public_b64=identity.public_b64,
@@ -42,6 +44,7 @@ class RendezvousClient:
             quic_port=quic_port,
             nat_type=nat_type,
             seeding_manifest_hashes=seeding_hashes or [],
+            wanted_manifest_hashes=wanted_hashes or [],
         )
         body = announce.model_dump(mode="json")
         body.pop("signature_b64", None)
@@ -51,13 +54,15 @@ class RendezvousClient:
             resp.raise_for_status()
         return RendezvousPeers.model_validate(resp.json())
 
-    async def connect(self, from_id: str, to_id: str, plan_id: str = "") -> ConnectTicket:
+    async def connect(self, identity: NodeIdentity, to_id: str, plan_id: str = "") -> ConnectTicket:
         """Ask the tracker to introduce us to `to_id`; returns a short-lived ticket
-        describing how to reach them (holepunch coordinates or a relay URL)."""
-        req = ConnectRequest(from_node_id=from_id, to_node_id=to_id, plan_id=plan_id)
+        describing how to reach them (holepunch coordinates or a relay URL).
+        Signed with our identity — the control plane rejects unsigned requests."""
+        req = ConnectRequest(from_node_id=identity.node_id, to_node_id=to_id, plan_id=plan_id)
+        body = req.model_dump(mode="json", exclude={"signature_b64"})
+        body["signature_b64"] = identity.sign_json(body)
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(
-                f"{self.base_url}/api/v1/rendezvous/connect", json=req.model_dump(mode="json"))
+            resp = await client.post(f"{self.base_url}/api/v1/rendezvous/connect", json=body)
             resp.raise_for_status()
         return ConnectTicket.model_validate(resp.json())
 
@@ -67,7 +72,6 @@ if __name__ == "__main__":
     # echoes back what an announce/connect exchange should look like, so we
     # confirm the signing + request/response shapes are wired correctly.
     import asyncio
-    import contextlib
     import threading
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -112,9 +116,11 @@ if __name__ == "__main__":
             assert verify_json(ident.public_b64, captured["announce"], sig), "signature must verify"
             print("announce signed + verified OK")
 
-            ticket = await client.connect(ident.node_id, "nd_other", plan_id="p1")
+            ticket = await client.connect(ident, "nd_other", plan_id="p1")
             assert ticket.ok and ticket.session_id == "s1"
             assert captured["connect"]["from_node_id"] == ident.node_id
+            sig = captured["connect"].pop("signature_b64")
+            assert verify_json(ident.public_b64, captured["connect"], sig), "connect must be signed"
             print("connect round-trip OK")
             print("rendezvous_client.py self-check PASSED")
         finally:

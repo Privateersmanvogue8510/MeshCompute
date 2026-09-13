@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 
 import httpx
+import pytest
 import respx
 
 PLAN_JSON = {
@@ -25,11 +26,24 @@ SSE_BODY = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _clear_models_cache():
+    """router._models_cache is keyed by backend URL with a 60s TTL — clear it so the
+    /v1/models probe below is actually exercised (and never served a stale list)."""
+    from meshcompute_gateway import router as gw_router
+
+    gw_router._models_cache.clear()
+    yield
+    gw_router._models_cache.clear()
+
+
 def test_streaming_chat_completions_is_openai_shaped_sse(gateway_client, gateway_env):
     plan = {**PLAN_JSON, "peer_chain": [gateway_env["node_id"]]}
     with respx.mock(assert_all_called=True) as router:
         router.post(f"{gateway_env['control_url']}/api/v1/schedule").mock(
             return_value=httpx.Response(200, json=plan))
+        router.get(f"{gateway_env['backend_url']}/v1/models").mock(
+            return_value=httpx.Response(200, json={"data": [{"id": "public/qwen3.8-27b-fable"}]}))
         router.post(f"{gateway_env['backend_url']}/v1/chat/completions").mock(
             return_value=httpx.Response(200, text=SSE_BODY))
 
@@ -59,6 +73,8 @@ def test_non_streaming_chat_completions_aggregates_to_one_completion(gateway_cli
     with respx.mock(assert_all_called=True) as router:
         router.post(f"{gateway_env['control_url']}/api/v1/schedule").mock(
             return_value=httpx.Response(200, json=plan))
+        router.get(f"{gateway_env['backend_url']}/v1/models").mock(
+            return_value=httpx.Response(200, json={"data": [{"id": "public/qwen3.8-27b-fable"}]}))
         router.post(f"{gateway_env['backend_url']}/v1/chat/completions").mock(
             return_value=httpx.Response(200, text=SSE_BODY))
 

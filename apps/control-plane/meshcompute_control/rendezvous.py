@@ -36,6 +36,8 @@ class _Peer:
     candidate: PeerCandidate
     seeding: set[str]
     last_announce: float
+    wanted: set[str] = field(default_factory=set)
+    wanted_since: dict[str, float] = field(default_factory=dict)   # hash -> first announce
 
 
 @dataclass
@@ -43,8 +45,10 @@ class RelayPair:
     """Two-sided queue pair for one relay session. Side "a" writes go to `to_b`
     and side "a" reads from `to_a` (i.e. each queue is named for its reader)."""
 
-    to_a: asyncio.Queue = field(default_factory=asyncio.Queue)
-    to_b: asyncio.Queue = field(default_factory=asyncio.Queue)
+    # bounded: a peer that never drains cannot make the control plane buffer
+    # unboundedly (SECURITY.md "Denial of service": bounded queues)
+    to_a: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=64))
+    to_b: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=64))
     _claimed: set[str] = field(default_factory=set)
 
     def claim_side(self) -> str | None:
@@ -69,6 +73,7 @@ class Rendezvous:
         self._identity = identity
         self._peers: dict[str, _Peer] = {}
         self._relays: dict[str, RelayPair] = {}
+        self._issued: dict[str, float] = {}   # session_id -> expires_at (from connect())
 
     # --- announce --------------------------------------------------------------
     def announce(self, req: RendezvousAnnounce, source_addr: str, now: float) -> RendezvousPeers:
@@ -89,14 +94,37 @@ class Rendezvous:
             nat_type=req.nat_type,
         )
         seeding = set(req.seeding_manifest_hashes)
-        self._peers[req.node_id] = _Peer(candidate, seeding, now)
+        wanted = set(req.wanted_manifest_hashes)
+        prev = self._peers.get(req.node_id)
+        since = {h: (prev.wanted_since.get(h, now) if prev else now) for h in wanted}
+        self._peers[req.node_id] = _Peer(candidate, seeding, now, wanted, since)
 
-        others = [
-            p.candidate
-            for nid, p in self._peers.items()
-            if nid != req.node_id and (p.seeding & seeding)
-        ]
-        return RendezvousPeers(ok=True, peers=others, your_reflexive_addr=reflexive)
+        # Roles are relative to what the announcer WANTS: a peer is a "seeder"
+        # only if it holds a wanted hash, a "leecher" if it is fetching one right
+        # now (so it will seed soon — wait for it rather than stampede origin).
+        # With nothing wanted, any content overlap is reported (plain discovery).
+        others: list[PeerCandidate] = []
+        for nid, p in self._peers.items():
+            if nid == req.node_id:
+                continue
+            if wanted and (p.seeding & wanted):
+                others.append(p.candidate.model_copy(update={"role": "seeder"}))
+            elif wanted and (p.wanted & wanted):
+                others.append(p.candidate.model_copy(update={"role": "leecher"}))
+            elif not wanted and (p.seeding & seeding):
+                others.append(p.candidate)
+        # Origin leader for the wanted content: among everyone wanting it (the
+        # announcer included) and nobody seeding it, the earliest starter wins.
+        # Deterministic on the tracker's clock, so a wave of nodes agrees on ONE
+        # origin downloader without any node-to-node coordination.
+        leader = None
+        if wanted and not any(p.role == "seeder" for p in others):
+            h = sorted(wanted)[0]
+            wanting = [(p.wanted_since[h], nid) for nid, p in self._peers.items()
+                       if h in p.wanted and h not in p.seeding]
+            leader = min(wanting)[1] if wanting else None
+        return RendezvousPeers(ok=True, peers=others, your_reflexive_addr=reflexive,
+                               origin_leader=leader)
 
     # --- connect -----------------------------------------------------------------
     def connect(self, req: ConnectRequest, now: float,
@@ -125,7 +153,14 @@ class Rendezvous:
         )
         signable = ticket.model_dump(mode="json", exclude={"control_signature_b64"})
         ticket.control_signature_b64 = self._identity.sign_json(signable)
+        self._issued[session_id] = now + ttl_s
+        for sid in [sid for sid, exp in self._issued.items() if exp < now - 3600]:
+            self._issued.pop(sid, None)
         return ticket
+
+    def session_known(self, session_id: str) -> bool:
+        """Only sessions handed out by connect() may open a relay."""
+        return session_id in self._issued
 
     # --- relay plumbing, used by app.py's websocket endpoint --------------------
     def relay_session(self, session_id: str) -> RelayPair:
@@ -146,11 +181,12 @@ def _demo() -> None:
     cp_identity = NodeIdentity.generate()
     rv = Rendezvous(cp_identity)
 
-    def _sign_announce(ident: NodeIdentity, node_id: str, seeding: list[str]) -> RendezvousAnnounce:
+    def _sign_announce(ident: NodeIdentity, node_id: str, seeding: list[str],
+                       wanted: list[str] | None = None) -> RendezvousAnnounce:
         a = RendezvousAnnounce(
             node_id=node_id, public_b64=ident.public_b64,
             local_addrs=["10.0.0.5:4000"], quic_port=4000,
-            seeding_manifest_hashes=seeding,
+            seeding_manifest_hashes=seeding, wanted_manifest_hashes=wanted or [],
         )
         payload = a.model_dump(mode="json", exclude={"signature_b64"})
         a.signature_b64 = ident.sign_json(payload)
@@ -163,6 +199,22 @@ def _demo() -> None:
     a2 = _sign_announce(other_key, "nd_b", ["hash1"])
     peers2 = rv.announce(a2, "5.6.7.8:8888", now=2.0)
     assert len(peers2.peers) == 1 and peers2.peers[0].node_id == "nd_a"
+
+    # two leechers of hash2 that both still SEED hash1 (an update wave): each must
+    # see the other as a "leecher" of hash2, never as a seeder via the old hash
+    k1, k2 = NodeIdentity.generate(), NodeIdentity.generate()
+    l1 = rv.announce(_sign_announce(k1, "nd_l1", ["hash1"], ["hash2"]), "1.1.1.1:1", now=4.0)
+    assert l1.peers == [] and l1.origin_leader == "nd_l1"        # first to want it -> origin
+    l2 = rv.announce(_sign_announce(k2, "nd_l2", ["hash1"], ["hash2"]), "2.2.2.2:2", now=5.0)
+    assert [(p.node_id, p.role) for p in l2.peers] == [("nd_l1", "leecher")]
+    assert l2.origin_leader == "nd_l1"                            # nd_l2 waits
+    # nd_l1 re-announcing while it downloads keeps its original "since"
+    again = rv.announce(_sign_announce(k1, "nd_l1", ["hash1"], ["hash2"]), "1.1.1.1:1", now=5.5)
+    assert again.origin_leader == "nd_l1"
+    # once nd_l1 has it, nd_l2 sees a seeder and no leader is needed
+    rv.announce(_sign_announce(k1, "nd_l1", ["hash1", "hash2"]), "1.1.1.1:1", now=6.0)
+    l2b = rv.announce(_sign_announce(k2, "nd_l2", ["hash1"], ["hash2"]), "2.2.2.2:2", now=7.0)
+    assert [(p.node_id, p.role) for p in l2b.peers] == [("nd_l1", "seeder")] and l2b.origin_leader is None
 
     # tampered payload must fail verification
     bad = _sign_announce(ann_key, "nd_c", ["hash1"])
@@ -182,6 +234,7 @@ def _demo() -> None:
         ticket.control_signature_b64,
     )
 
+    assert not rv.session_known("sess_x") and rv.session_known(ticket.session_id)
     pair = rv.relay_session("sess_x")
     assert pair.claim_side() == "a"
     assert pair.claim_side() == "b"

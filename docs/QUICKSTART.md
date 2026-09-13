@@ -1,224 +1,227 @@
 # Quickstart
 
-Two real, working flows. Both are copy-pasteable. Every command below is checked
-against `apps/cli/meshcompute_cli/main.py` — if a flag isn't listed here, it doesn't
-exist yet.
+Every command below is checked against `apps/cli/meshcompute_cli/main.py` — if a
+flag isn't listed here, it doesn't exist yet.
 
-Prerequisite for both flows: Python 3.12+.
+## 1. Install (Linux, macOS, Windows)
 
-```bash
-git clone https://github.com/mr-tbot/MeshCompute.git
-cd MeshCompute
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -e .
-```
+Prerequisite: **Python 3.12+** and `git`. No GPU required — a CPU-only machine
+contributes CPU, RAM and storage; an NVIDIA GPU is used when present.
 
-(Or run `scripts/install.sh`, which does the same three steps and checks your Python
-version first.)
+| OS | Install | Then |
+|---|---|---|
+| **Linux** | `git clone https://github.com/mr-tbot/MeshCompute.git && cd MeshCompute && ./scripts/install.sh` | `source .venv/bin/activate` |
+| **macOS** (Apple Silicon or Intel) | same as Linux | `source .venv/bin/activate` |
+| **Windows** (PowerShell) | `git clone https://github.com/mr-tbot/MeshCompute.git; cd MeshCompute; powershell -ExecutionPolicy Bypass -File scripts\install.ps1` | `.\.venv\Scripts\Activate.ps1` |
+
+Both installers only create `.venv/` inside the checkout and `pip install -e .`
+into it — nothing system-wide, no admin. (Manual equivalent:
+`python3.12 -m venv .venv && source .venv/bin/activate && pip install -e .`.)
+
+### What the node installs on first run, per platform
+
+`mesh node start` downloads a prebuilt `llama.cpp` release for your machine
+into `~/.mesh/runtime/` (`%USERPROFILE%\.mesh\runtime\` on Windows), verifies
+it runs, and caches it. Nothing is compiled unless you ask.
+
+| Platform | Engine build used | Notes |
+|---|---|---|
+| Linux x64/arm64, no GPU | upstream `bin-ubuntu-<arch>` CPU build | glibc distros; Alpine/musl not supported |
+| Linux + NVIDIA | upstream **Vulkan** build (runs on the NVIDIA driver, no CUDA toolkit needed) | upstream ships no Linux+CUDA prebuilt. For CUDA-native speed: `--accel cuda-build` compiles once (needs `git`, `cmake`, a C++ toolchain and `nvcc`) |
+| Linux + NVIDIA without `libvulkan1` | falls back to the CPU build | install your distro's `libvulkan1` to get the GPU path |
+| macOS arm64 / x64 | upstream macOS build, **Metal** on (all layers offloaded) | |
+| Windows x64 + NVIDIA | upstream **CUDA 12.4** build + its `cudart` DLL bundle | driver ≥ 550 |
+| Windows x64/arm64, no GPU | upstream `win-cpu-<arch>` build | |
+
+The daemon prints which build it ended up with, e.g.
+`[mesh] engine ready: cpu build b10948 at ...`. `--accel {auto,cuda,cuda-build,vulkan,metal,cpu}`
+or `MESH_ACCEL=...` forces a choice; an unavailable choice degrades down the
+cascade (cuda-build → vulkan → cpu) and says so.
+
+`MESH_HOME` relocates everything the node stores (engine, models, identity,
+logs) away from `~/.mesh` — useful for a second node on one box or a bigger disk.
 
 ---
 
-## A. Standalone node (no control plane, no other service)
-
-This is the whole product in one command. It self-installs `llama.cpp`, downloads a
-model, serves it locally, and exposes an OpenAI-compatible endpoint:
+## 2. Standalone node (no control plane, no other service)
 
 ```bash
 mesh node start
 ```
 
-What happens, in order (see `node/daemon/meshcompute_node/daemon.py`):
-
-1. Detects your accelerator (`cuda` / `metal` / `cpu`).
-2. Downloads and caches a `llama-server` build for your platform (prebuilt release
-   where one exists; source build otherwise — see **Known limits** below).
-3. Downloads a small CPU-friendly model (`bartowski/SmolLM2-360M-Instruct-GGUF`) to
-   `~/.mesh/models/` and caches it — this is the Phase-1 smoke default. (The CLI does
-   not yet expose a `--model` flag to pick a different one at start time; see
-   **Known limits**.)
-4. Starts `llama-server` and prints the local endpoint, e.g.:
+1. Detects your accelerator and installs the engine (table above).
+2. **Picks a model channel.** On a terminal it shows the catalog and asks:
    ```
-   [mesh] Local endpoint ready: http://127.0.0.1:53214/v1  (point your OpenAI client here)
+   Available model channels:
+     1. public/qwen3.8-27b-fable  v1  24.0 GB  [needs 24 GB, you have 30]  Qwen3.8-27B ...
+     2. public/smollm2-360m  v1  0.3 GB  [fits]  SmolLM2 360M Instruct (CPU smoke channel)
+     0. built-in smoke model (SmolLM2-360M, CPU-friendly)
+   Select model to contribute to and use [0]:
    ```
-5. Tries to register with a control plane at `http://127.0.0.1:8080` (override with
-   `--control-url`). If none is reachable, it prints and runs in **SOLO mode** — the
-   local endpoint still works, you're just not contributing to a network.
+   The choice is remembered in `~/.mesh/models/state.json`; later starts don't
+   ask. `--model <alias>` skips the prompt (`--model smoke` = built-in tiny model);
+   `mesh node models` lists channels with size and whether they fit here.
+3. **Gets the model.** Peers seeding that channel first (BLAKE3-verified chunks
+   over QUIC), Hugging Face as the fallback (resumable; `HF_TOKEN` honoured).
+   Every file is verified against the signed manifest before it's used.
+4. Starts `llama-server` on a **fixed local port** (`8099`, `--port` to change) and prints:
+   ```
+   [mesh] Local endpoint ready: http://127.0.0.1:8099/v1  (point your OpenAI client here)
+   ```
+5. Registers with a control plane at `http://127.0.0.1:8080` (`--control-url`
+   to change). None reachable → **SOLO mode**: the local endpoint still works,
+   you're just not contributing or following channel updates.
 
-Talk to it immediately with any OpenAI client, or `curl` (replace the port with the
-one printed above):
+Talk to it with any OpenAI client, or `curl`:
 
 ```bash
-curl http://127.0.0.1:53214/v1/models
-
-curl http://127.0.0.1:53214/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model": "local", "messages": [{"role": "user", "content": "Say hi in 3 words."}]}'
+curl http://127.0.0.1:8099/v1/models
+curl http://127.0.0.1:8099/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model": "public/smollm2-360m", "messages": [{"role": "user", "content": "Say hi in 3 words."}]}'
 ```
 
-### Contribution / idle flags
+### Model channels and updates
+
+A catalog alias (`public/smollm2-360m`) is a **channel**: a class of model whose
+current version the catalog publishes. When the operator pushes a new version of
+the same channel (see `docs/DEPLOYMENT.md`), every node following it, on its next
+poll (`--update-poll`, default 300 s):
+
+1. downloads the new files in the background — from peers that already have
+   them, else Hugging Face — while the old engine keeps serving;
+2. suspends its network heartbeat (the scheduler routes around it), stops the
+   old engine and starts the new one on the **same port**;
+3. deletes the old version's files, so a machine following a channel holds
+   exactly one copy. The local endpoint is down for one engine load (seconds for
+   a small model, ~a minute for a 24 GB one).
+
+If the new engine fails to start, the node restarts the old version and keeps
+its files; a catalog offering a *lower* version than a node runs is ignored.
+
+An update wave doesn't stampede the origin: the rendezvous tracker names one
+**origin leader** per file (the node that started wanting it first, on the
+tracker's clock) and tells everyone else which peers are already fetching it.
+Followers wait (up to 30 min, scaled to the file size) for the leader to finish
+and seed, then fetch from it peer-to-peer. One node per wave pays the origin
+download. Polls are jittered ±30 %.
+
+### Contribution / resource flags
 
 `mesh node start` donates a share of this machine to the network once idle, by
-default. Every flag below is real (`apps/cli/meshcompute_cli/main.py`):
-
-```bash
-mesh node start \
-  --idle-only \
-  --idle-minutes 10 \
-  --pause-on-activity \
-  --max-vram 85 \
-  --max-cpu 50 \
-  --max-ram 32 \
-  --require-ac-power
-```
+default. Every flag below is real:
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--idle-only` / `--no-idle-only` | `--idle-only` | Only contribute to the network while this machine is idle |
-| `--idle-minutes N` | `10` | Minutes of no user input required before contribution starts |
-| `--pause-on-activity` / `--no-pause-on-activity` | `--pause-on-activity` | Pause contribution the instant user input is detected again |
+| `--model ALIAS` | ask / saved | Channel to contribute to and use; `smoke` = built-in tiny model |
+| `--quant ID` | manifest's first | Quantization from the manifest (e.g. `Q6_K-MAX`) |
+| `--port N` | `8099` | Local OpenAI endpoint port (stable across updates) |
+| `--quic-port N` | `0` (any) | UDP port of the peer data plane |
+| `--accel` | `auto` | Engine build (see table above) |
+| `--idle-only` / `--no-idle-only` | `--idle-only` | Only contribute while this machine is idle |
+| `--idle-minutes N` | `10` | Minutes without keyboard/mouse input before contributing |
+| `--pause-on-activity` / `--no-pause-on-activity` | on | Pause the instant input is detected |
 | `--max-vram N` | `85` | Max % of VRAM to contribute |
-| `--max-cpu N` | `50` | Max % of CPU to contribute |
-| `--max-ram N` | unset (no cap) | Max RAM, in GB, to contribute |
-| `--require-ac-power` / `--no-require-ac-power` | `--no-require-ac-power` | Only contribute while on AC power (laptops) |
-| `--backend {llamacpp,lmstudio}` | `llamacpp` | Inference backend — `llamacpp` self-installs; `lmstudio` requires `--backend-url` pointing at an already-running OpenAI-compatible server |
-| `--pool` | `public` | Pool ID to join |
-| `--gpu-devices` | `auto` | Which GPUs to donate: `auto` (every detected card), or explicit indices, e.g. `0,1` or `0` |
-| `--split-mode {layer,row}` | `layer` | How to split a model across multiple selected GPUs (passed to `llama-server --split-mode`) |
-| `--tensor-split` | unset (proportional to free VRAM) | Explicit per-GPU split proportions, e.g. `3,1` |
-| `--control-url` | `http://127.0.0.1:8080` | Control-plane URL |
+| `--max-cpu N` | `50` | Max % of CPU (→ `--threads` of the engine) |
+| `--max-ram N` | unset | Max RAM, GB (bounds the context size) |
+| `--max-storage N` | `100` | Max GB of model files kept/seeded; advertised as `storage_share_bytes` |
+| `--require-ac-power` | off | Laptops: only on mains |
+| `--gpu-devices` | `auto` | Which NVIDIA cards to donate, e.g. `0,1` or `0` |
+| `--split-mode {layer,row}`, `--tensor-split` | `layer`, proportional | Multi-GPU split |
+| `--update-poll N` | `300` | Seconds between channel-update checks |
+| `--backend lmstudio --backend-url URL` | – | Register an existing OpenAI server instead of the embedded engine |
+| `--pool`, `--control-url` | `public`, `http://127.0.0.1:8080` | |
 
-Being "paused" only stops advertising availability to the *network* — your own
-local `/v1` endpoint keeps working the whole time (`contribution.py`). These map
-1:1 onto the `availability`/`compute` sections of `CONFIGURATION.md`; see
-**docs/DEPLOYMENT.md** for how a `deploy/nodes.local.yaml` entry mirrors them.
+Idle detection is real on all three OSes (`node/daemon/meshcompute_node/sysinfo.py`):
+X11 `xprintidle` on Linux (Wayland: no input signal, CPU/GPU/AC gates still
+apply), `IOHIDSystem` on macOS, `GetLastInputInfo` on Windows. Being "paused"
+only stops advertising availability to the *network* — your own local `/v1`
+endpoint keeps working.
 
 ### Known limits (Phase 1)
 
-- **No `--model` flag yet.** `mesh node start` always resolves to the CPU smoke
-  model above. The daemon itself (`daemon.async_main`) accepts a `model=` argument
-  and can resolve any alias from the control-plane catalog (e.g.
-  `public/qwen3.8-27b-fable`), but the CLI doesn't forward it yet. To serve a
-  specific catalog model today, either drive the daemon module directly
-  (`python -c "from meshcompute_node.daemon import run; run(model='public/qwen3.8-27b-fable')"`)
-  or register an existing OpenAI-compatible server that already has it loaded — see
-  **docs/DEPLOYMENT.md**.
-- **CUDA build.** No prebuilt Linux+CUDA `llama-server` release exists upstream
-  today, so a CUDA node builds `llama.cpp` from source on first run (slower first
-  start, cached after).
-- **Multi-GPU.** `mesh node start --gpu-devices 0,1` selects specific cards
-  (default `auto` = every detected GPU); `--split-mode`/`--tensor-split` control
-  how a model is split across them. The scheduler already sums VRAM across a
-  node's selected GPUs and treats a multi-GPU box (e.g. a 2×RTX 3090 NVLINK pod)
-  as one larger pod. Untested on real multi-GPU hardware in this repo so far
-  (no GPU box available to this checkout) — the launch-arg construction itself
-  is unit-tested against a captured `nvidia-smi` sample
-  (`node/runtime/meshcompute_runtime/backends/llamacpp.py`).
+- **Linux + NVIDIA runs the Vulkan build by default.** CUDA-native needs
+  `--accel cuda-build` and a toolkit. Vulkan multi-GPU selection uses
+  `GGML_VK_VISIBLE_DEVICES` with the same indices as `nvidia-smi`, which holds
+  on single-vendor boxes.
+- **Windows and macOS are not yet verified on real hardware in this repo.**
+  The asset selection, extraction and host-signal code paths are unit-tested
+  against the upstream release names and documented OS APIs; the first run on a
+  real Windows/macOS machine is the verification. Please report the
+  `[mesh] engine ready:` line.
+- **Public catalog hashes.** `public/smollm2-360m` is fully pinned (BLAKE3).
+  `public/qwen3.8-27b-fable` still carries `PENDING` hashes — see the comment
+  at the top of its manifest for the one-command pin.
+- **Multi-GPU tensor-split is unit-tested, not run on a real multi-GPU box here.**
 
 ---
 
-## B. Run the mesh: control-plane + gateway + a node
+## 3. Run the mesh: control plane + gateway + nodes
 
-This is the full architecture: a control plane (identity, catalog, scheduling), a
-gateway (the trusted OpenAI-compatible surface), and one or more nodes.
-
-**1. Start the control plane** (default `127.0.0.1:8080`):
+**1. Control plane** (default `127.0.0.1:8080`):
 
 ```bash
 uvicorn meshcompute_control.app:app --host 127.0.0.1 --port 8080
 ```
 
-It loads every manifest in `models/manifests/*.yaml` at startup — including
-`public/qwen3.8-27b-fable`, the first published catalog target.
+It loads every manifest in `models/manifests/*.yaml`, signs them, and
+re-scans the directory every 30 s — dropping a manifest with a higher `version`
+in there **is** how you push a channel update.
 
-**2. Start the gateway** (default `127.0.0.1:8081`), in another terminal:
+**2. Gateway** (default `127.0.0.1:8081`):
 
 ```bash
 mesh api serve
 ```
 
-(`mesh api serve --port 8081 --control-url http://127.0.0.1:8080` to be explicit;
-both are already the defaults.)
-
-**3. Start a node**, in another terminal:
+**3. Nodes** — as many as you like, on any machine that can reach the control plane:
 
 ```bash
-mesh node start
+mesh node start --model public/smollm2-360m --control-url http://<control-plane>:8080
 ```
 
-Note the `[mesh] node identity: <node_id>` and `[mesh] Local endpoint ready: ...`
-lines it prints.
+The second and later nodes fetch the model **from the first ones** (watch for
+`[mesh] fetching ... from peer ...` and `obtained from peers (verified)`), and
+every node seeds what it holds.
 
-**4. Wire the node into the gateway's routing table.**
-
-The control-plane's scheduler picks *which* node_id should serve a request, but the
-gateway resolves that node_id to an actual HTTP endpoint from
-`deploy/nodes.local.yaml` (gitignored — never committed, no real IPs in this public
-repo). Copy the template and fill in the node_id and endpoint you just saw printed:
-
-```bash
-cp deploy/nodes.example.yaml deploy/nodes.local.yaml
-```
-
-Edit the `nodes:` entry so its `node_id` is the one your node printed, and
-`backend_url` is its local endpoint **without** the `/v1` suffix (e.g.
-`http://127.0.0.1:53214`). Full shape and every field: **docs/DEPLOYMENT.md**.
+**4. Wire nodes into the gateway's routing table.** The scheduler picks *which*
+node serves a request; the gateway resolves that node_id to an HTTP endpoint from
+`deploy/nodes.local.yaml` (gitignored). Copy the template and add each node's
+`node_id` (printed at start) and `backend_url` (its local endpoint **without**
+`/v1`): `cp deploy/nodes.example.yaml deploy/nodes.local.yaml`. Edits are picked
+up without restarting the gateway. Full shape: **docs/DEPLOYMENT.md**.
 
 **5. Use it:**
 
 ```bash
 mesh models
-mesh chat --model public/qwen3.8-27b-fable
-mesh bench --model public/qwen3.8-27b-fable --tokens 128
+mesh chat --model public/smollm2-360m
+mesh bench --model public/smollm2-360m --tokens 128
 ```
 
-`mesh models` lists whatever the gateway/control-plane currently serve.
-`mesh chat` is an interactive streaming REPL against `/v1/chat/completions`
-(Ctrl-C cancels a turn, Ctrl-D quits) that also prints the scheduler's
-`X-Mesh-Strategy`/`X-Mesh-Path` for each turn. `mesh bench` streams one fixed
-prompt and reports TTFT, total time, and decode tokens/sec.
-
-> Because the CLI can't yet start a node loaded with a specific catalog model (see
-> **Known limits** above), `mesh chat --model public/qwen3.8-27b-fable` only
-> succeeds once *some* registered node can actually serve that model — either a
-> big-enough node started via the daemon's `model=` argument directly, or an
-> existing OpenAI-compatible endpoint (e.g. a GPU box already running the model)
-> registered with `scripts/register_external_backend.py` (see
-> **docs/DEPLOYMENT.md**). Against a plain `mesh node start` CPU box, chat against
-> whatever model id it actually reports from `mesh models` instead (the smoke
-> model, `local`).
-
-### Point any OpenAI client at the gateway
+`mesh chat` prints the scheduler's `X-Mesh-Strategy`/`X-Mesh-Path` per turn. The
+gateway only accepts single-node plans in Phase 1 and refuses (409) to stream
+from a node that reports a different model than the one you asked for.
 
 ```python
 from openai import OpenAI
-
 client = OpenAI(base_url="http://127.0.0.1:8081/v1", api_key="unused")
-resp = client.chat.completions.create(
-    model="public/qwen3.8-27b-fable",
-    messages=[{"role": "user", "content": "hello"}],
-    stream=True,
-)
-for chunk in resp:
+for chunk in client.chat.completions.create(model="public/smollm2-360m",
+        messages=[{"role": "user", "content": "hello"}], stream=True):
     print(chunk.choices[0].delta.content or "", end="")
 ```
-
-Any client that speaks the OpenAI Chat Completions API works — the gateway never
-looks at the client's own `Authorization` header when building the backend request
-(`apps/gateway/meshcompute_gateway/app.py`, `SECURITY.md` tool boundary).
 
 ### Other CLI commands
 
 ```bash
-mesh login --token <TOKEN>        # saves a token to ~/.mesh/config.json (Phase-1: auth is a stub)
-mesh node status                  # list nodes known to the control plane
-mesh pool list                    # list pools
-mesh pool create NAME [--private]
-mesh manifest sign PATH.yaml      # sign a ModelManifest -> PATH.signed.json
+mesh node models                  # channels, sizes, fits-here, installed version
+mesh node status                  # nodes known to the control plane
+mesh pool list / mesh pool create NAME [--private]
+mesh manifest pin PATH.yaml       # fill real BLAKE3 + sizes from local files
+mesh manifest sign PATH.yaml      # -> PATH.signed.json (same scheme the control plane uses)
 mesh manifest verify PATH.signed.json
+mesh login --token <TOKEN>        # Phase-1: auth is a stub
 ```
 
-More on operating this in production (env vars, systemd, Docker Compose, the
-RPC layer-split runbook, security posture): **docs/DEPLOYMENT.md**. The physics
-behind "more peers = faster" and its one hard limit: **docs/PHYSICS.md**. Measured
-numbers: **docs/BENCHMARKS.md**.
+Operating in production (env vars, systemd, Docker Compose, channel pushes,
+security posture): **docs/DEPLOYMENT.md**. The physics of "more peers = faster":
+**docs/PHYSICS.md**. Measured numbers: **docs/BENCHMARKS.md**.
