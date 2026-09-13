@@ -1,0 +1,29 @@
+[Unit]
+Description=MeshCompute gateway (OpenAI-compatible + native HTTP surface)
+After=network-online.target mesh-control-plane.service
+Wants=network-online.target
+# Not a hard dependency: the gateway can start before the control plane and
+# will simply 503 scheduling requests until it's reachable.
+
+[Service]
+Type=simple
+# EDIT: the unprivileged user/group that should own this process.
+User=mesh
+Group=mesh
+# EDIT: absolute path to your checkout of this repo.
+WorkingDirectory=/opt/meshcompute
+# EDIT: absolute path to the venv created by scripts/install.sh (or your own).
+ExecStart=/opt/meshcompute/.venv/bin/mesh api serve --port 8081
+Restart=on-failure
+RestartSec=5
+
+# Optional overrides — see docs/DEPLOYMENT.md for the full MESH_GW_* list.
+# Environment=MESH_GW_CONTROL_URL=http://127.0.0.1:8080
+# Environment=NODES_LOCAL_FILE=deploy/nodes.local.yaml
+
+# Bind to 127.0.0.1 (the default) and put a reverse proxy (with TLS) in front
+# for a public deployment (SECURITY.md); do not expose uvicorn directly to the
+# internet without one.
+
+[Install]
+WantedBy=multi-user.target

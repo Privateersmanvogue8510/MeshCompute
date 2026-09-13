@@ -1,0 +1,27 @@
+[Unit]
+Description=MeshCompute control plane (identity, catalog, rendezvous, scheduler)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# EDIT: the unprivileged user/group that should own this process and its data.
+User=mesh
+Group=mesh
+# EDIT: absolute path to your checkout of this repo.
+WorkingDirectory=/opt/meshcompute
+# EDIT: absolute path to the venv created by scripts/install.sh (or your own).
+ExecStart=/opt/meshcompute/.venv/bin/uvicorn meshcompute_control.app:app --host 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=5
+
+# Optional overrides — see docs/DEPLOYMENT.md for the full MESH_CP_* list.
+# Environment=MESH_CP_DB=var/control.db
+# Environment=MESH_CP_MANIFEST_DIR=models/manifests
+
+# Bind to 127.0.0.1 above and put a reverse proxy (with TLS) in front for a
+# public deployment (SECURITY.md); do not expose uvicorn directly to the
+# internet without one.
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,55 @@
+# MeshCompute control-plane + gateway.
+#
+# Contributor nodes (`mesh node start`) are NOT run here — nodes normally run on
+# contributor machines (often with a GPU they self-detect), self-install their
+# own inference engine, and connect to the control plane over the network.
+# Running a node inside this compose file would defeat the point of a
+# distributed network. Point real nodes at this control plane's public URL via
+# `mesh node start --control-url https://your-control-plane.example.org`.
+#
+# Build context is the repo root (../.. from this file) because
+# `pip install -e .` needs the whole tree — see infra/docker/Dockerfile.
+#
+# Usage:
+#   docker compose -f infra/compose/docker-compose.yml up -d
+#
+# Real deploy config (deploy/nodes.local.yaml) is never baked into the image —
+# uncomment the mounts below and point them at your own gitignored local file.
+
+services:
+  control-plane:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile
+    image: meshcompute:latest
+    command: ["uvicorn", "meshcompute_control.app:app", "--host", "0.0.0.0", "--port", "8080"]
+    ports:
+      - "8080:8080"
+    environment:
+      MESH_CP_DB: var/control.db
+      MESH_CP_MANIFEST_DIR: models/manifests
+    volumes:
+      - ../../models/manifests:/app/models/manifests:ro
+      - control-plane-var:/app/var
+      # - ../nodes.local.yaml:/app/deploy/nodes.local.yaml:ro
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile
+    image: meshcompute:latest
+    command: ["uvicorn", "meshcompute_gateway.app:app", "--host", "0.0.0.0", "--port", "8081"]
+    ports:
+      - "8081:8081"
+    environment:
+      MESH_GW_CONTROL_URL: "http://control-plane:8080"
+    volumes:
+      - ../../models/manifests:/app/models/manifests:ro
+      # - ../nodes.local.yaml:/app/deploy/nodes.local.yaml:ro
+    depends_on:
+      - control-plane
+    restart: unless-stopped
+
+volumes:
+  control-plane-var:

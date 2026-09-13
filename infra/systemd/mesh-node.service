@@ -1,0 +1,34 @@
+[Unit]
+Description=MeshCompute contributor node (self-installs an inference engine, contributes idle compute)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# EDIT: run as the desktop user who owns this machine, not a dedicated system
+# user — the node caches models/engine under that user's ~/.mesh/.
+User=YOUR_USERNAME
+Group=YOUR_USERNAME
+# EDIT: absolute path to your checkout of this repo.
+WorkingDirectory=/opt/meshcompute
+# EDIT: absolute path to the venv created by scripts/install.sh (or your own).
+# Flags shown are the CLI defaults, spelled out — edit the percentages/minutes
+# for this machine (see docs/QUICKSTART.md for the full flag table).
+ExecStart=/opt/meshcompute/.venv/bin/mesh node start \
+    --idle-only --idle-minutes 10 --pause-on-activity \
+    --max-vram 85 --max-cpu 50 --no-require-ac-power \
+    --control-url http://127.0.0.1:8080
+Restart=on-failure
+RestartSec=10
+
+# NOTE on idle detection: user_idle_seconds() (node/daemon/meshcompute_node/
+# contribution.py) reads xprintidle over $DISPLAY, which a system-level
+# (User=) unit will NOT have. Without it, idle detection degrades gracefully
+# to "unknown" and is simply not blocked on — --idle-only will still gate on
+# CPU/GPU%/AC power, just not on real user input idle time. To get real idle
+# detection, either run this as a systemd --user unit for your desktop session
+# (so $DISPLAY is inherited) or pass --no-idle-only for an always-on headless
+# box that has no interactive user to wait for anyway.
+
+[Install]
+WantedBy=multi-user.target
