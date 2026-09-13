@@ -1,22 +1,43 @@
-# MeshCompute node/deploy registry — EXAMPLE (safe to commit).
-# Copy to deploy/nodes.local.yaml (gitignored) and fill in REAL hosts there.
-# NEVER put real internal IPs, public IPs, or credentials in this example file.
+# MeshCompute deploy config — EXAMPLE (safe to commit; NO real IPs/creds here).
+# Copy to deploy/nodes.local.yaml (gitignored) for a real deployment.
+#
+# The DEFAULT node is STANDALONE: it installs its own llama.cpp engine, downloads
+# the model itself, runs on the local GPU, and exposes a local OpenAI endpoint.
+# You do NOT need LM Studio, Ollama, or any other service for a standalone node.
+
 control_plane:
-  bind: "0.0.0.0:8080"
-  public_url: "https://rendezvous.example.org"   # public rendezvous/tracker URL
+  bind: "127.0.0.1:8080"
+  db_path: "var/control.db"
+  manifest_dir: "models/manifests"
+
 gateway:
-  bind: "0.0.0.0:8081"
+  bind: "127.0.0.1:8081"
+  control_url: "http://127.0.0.1:8080"
+
+# Public rendezvous / tracker (internet-native NAT traversal — no VPN, no tailnet).
+rendezvous:
+  public_url: "https://rendezvous.example.org"
+  stun_servers:
+    - "stun.l.google.com:19302"
+    - "stun1.l.google.com:19302"
+
 nodes:
-  - name: gpu-pod-example
+  # DEFAULT: a standalone worker. It self-installs the engine and downloads the
+  # model; nothing else to point it at. Just: `mesh node start`.
+  - name: my-gpu-node
     role: worker
-    backend: lmstudio
-    # endpoint the daemon proxies to (the OpenAI-compatible server on the pod)
-    backend_url: "http://LAN-IP-OF-POD:1234"
+    backend: llamacpp          # standalone embedded engine (self-installed)
+    model: public/qwen3.8-27b-fable
     pool: public
-    gpus: 2
-  - name: cpu-helper-example
-    role: worker
-    backend: llamacpp
-    pool: public
-stun_servers:
-  - "stun.l.google.com:19302"
+    idle_only: true
+    max_vram_percent: 85
+
+  # OPTIONAL: register an EXISTING OpenAI-compatible server you already run
+  # (LM Studio / vLLM / an existing llama-server). Not required, and not the
+  # default. `backend_url` is the only case where a real endpoint is configured,
+  # and it lives ONLY in deploy/nodes.local.yaml, never in a committed file.
+  # - name: my-existing-endpoint
+  #   role: worker
+  #   backend: openai_external
+  #   backend_url: "http://HOST:PORT"   # local file only — never commit a real one
+  #   pool: public
