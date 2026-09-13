@@ -212,7 +212,7 @@ prebuilt. Alpine / musl is not supported (upstream builds are glibc).
 
 ### macOS
 
-Apple Silicon or Intel, macOS 12 or newer:
+Apple Silicon or Intel:
 
 ```bash
 xcode-select --install                   # git, if you don't have it
