@@ -252,11 +252,23 @@ def node_status() -> None:
 @click.option("--backend", type=click.Choice(["lmstudio", "llamacpp"]), default="llamacpp")
 @click.option("--backend-url", default=None, help="URL of the local inference backend.")
 @click.option("--pool", "pool_id", default="public")
-@click.option("--idle-only/--no-idle-only", default=True)
+@click.option("--idle-only/--no-idle-only", default=True,
+              help="Only contribute to the network while this machine is idle.")
+@click.option("--idle-minutes", "idle_minutes_before_start", default=10, type=int,
+              help="Minutes of no user input required before contributing.")
+@click.option("--pause-on-activity/--no-pause-on-activity", "pause_on_user_activity", default=True,
+              help="Pause contribution the moment user input is detected again.")
 @click.option("--max-vram", "max_vram_percent", default=85, type=int, help="Max VRAM percent to contribute.")
+@click.option("--max-cpu", "max_cpu_percent", default=50, type=int, help="Max CPU percent to contribute.")
+@click.option("--max-ram", "max_ram_gb", default=None, type=int,
+              help="Max RAM, in GB, to contribute (unset = no explicit cap).")
+@click.option("--require-ac-power/--no-require-ac-power", default=False,
+              help="Only contribute while on AC power (laptops).")
 @click.option("--control-url", default=None)
 def node_start(backend: str, backend_url: str | None, pool_id: str, idle_only: bool,
-               max_vram_percent: int, control_url: str | None) -> None:
+               idle_minutes_before_start: int, pause_on_user_activity: bool,
+               max_vram_percent: int, max_cpu_percent: int, max_ram_gb: int | None,
+               require_ac_power: bool, control_url: str | None) -> None:
     """Start the node daemon (contributes capacity to the mesh)."""
     try:
         from meshcompute_node import daemon as node_daemon
@@ -269,7 +281,10 @@ def node_start(backend: str, backend_url: str | None, pool_id: str, idle_only: b
 
     control = control_url or get_control_url()
     opts = dict(backend=backend, backend_url=backend_url, pool_id=pool_id,
-                idle_only=idle_only, max_vram_percent=max_vram_percent, control_url=control)
+                idle_only=idle_only, idle_minutes_before_start=idle_minutes_before_start,
+                pause_on_user_activity=pause_on_user_activity,
+                max_vram_percent=max_vram_percent, max_cpu_percent=max_cpu_percent,
+                max_ram_gb=max_ram_gb, require_ac_power=require_ac_power, control_url=control)
     if hasattr(node_daemon, "run"):
         node_daemon.run(**opts)
     elif hasattr(node_daemon, "async_main"):

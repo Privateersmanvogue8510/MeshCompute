@@ -30,6 +30,16 @@ class ContributionPolicy(BaseModel):
     max_vram_percent: int = 85
     max_cpu_percent: int = 50
     allow_public_pool: bool = True
+    # --- CONFIGURATION.md "availability"/"thermal" controls. All optional +
+    # backward-compatible (defaults match CONFIGURATION.md's own example
+    # config) so existing callers/tests that only set the fields above are
+    # unaffected. Enforced by node/daemon/meshcompute_node/contribution.py.
+    idle_minutes_before_start: int = 10
+    pause_on_user_activity: bool = True
+    require_ac_power: bool = False
+    max_ram_gb: int | None = None          # None = no explicit absolute cap
+    gpu_temperature_limit_c: int = 82
+    schedule: str | None = None            # TODO(phase-1.5): real schedule syntax + parser
 
 
 class BenchmarkResult(BaseModel):
