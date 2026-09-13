@@ -5,6 +5,8 @@ deploy/*.local.*
 deploy/local.env
 deploy/nodes.local.yaml
 deploy/nodes.local.yml
+deploy/identities/
+deploy/*.key.json
 *.local.env
 secrets/
 *.key
