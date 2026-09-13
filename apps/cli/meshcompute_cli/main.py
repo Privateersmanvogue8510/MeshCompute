@@ -264,11 +264,20 @@ def node_status() -> None:
               help="Max RAM, in GB, to contribute (unset = no explicit cap).")
 @click.option("--require-ac-power/--no-require-ac-power", default=False,
               help="Only contribute while on AC power (laptops).")
+@click.option("--gpu-devices", default="auto",
+              help='Which GPUs to donate: "auto" (all detected), or explicit indices '
+                   'e.g. "0,1" or "0".')
+@click.option("--split-mode", type=click.Choice(["layer", "row"]), default="layer",
+              help="How to split a model across multiple selected GPUs.")
+@click.option("--tensor-split", default=None,
+              help='Explicit per-GPU split proportions, e.g. "3,1" (default: '
+                   "proportional to each selected GPU's free VRAM).")
 @click.option("--control-url", default=None)
 def node_start(backend: str, backend_url: str | None, pool_id: str, idle_only: bool,
                idle_minutes_before_start: int, pause_on_user_activity: bool,
                max_vram_percent: int, max_cpu_percent: int, max_ram_gb: int | None,
-               require_ac_power: bool, control_url: str | None) -> None:
+               require_ac_power: bool, gpu_devices: str, split_mode: str,
+               tensor_split: str | None, control_url: str | None) -> None:
     """Start the node daemon (contributes capacity to the mesh)."""
     try:
         from meshcompute_node import daemon as node_daemon
@@ -284,7 +293,9 @@ def node_start(backend: str, backend_url: str | None, pool_id: str, idle_only: b
                 idle_only=idle_only, idle_minutes_before_start=idle_minutes_before_start,
                 pause_on_user_activity=pause_on_user_activity,
                 max_vram_percent=max_vram_percent, max_cpu_percent=max_cpu_percent,
-                max_ram_gb=max_ram_gb, require_ac_power=require_ac_power, control_url=control)
+                max_ram_gb=max_ram_gb, require_ac_power=require_ac_power,
+                gpu_devices=gpu_devices, split_mode=split_mode, tensor_split=tensor_split,
+                control_url=control)
     if hasattr(node_daemon, "run"):
         node_daemon.run(**opts)
     elif hasattr(node_daemon, "async_main"):

@@ -93,19 +93,73 @@ def gpu_temperature_c() -> float | None:
     return None
 
 
-def total_vram_bytes() -> int:
-    """Total VRAM across nvidia GPUs, or 0 (CPU-only box / no nvidia-smi)."""
+def parse_gpu_devices(gpu_devices: str | list[int] | None) -> set[int] | None:
+    """The "donate a percentage of the PC" per-GPU on/off selection: None
+    return = "auto" (every detected GPU enabled); otherwise the explicit set
+    of physical indices a contributor chose to donate. Shared by capability.py
+    (enumeration) and the budget helpers below (single source of truth for
+    what "selected" means)."""
+    if gpu_devices is None or gpu_devices == "auto":
+        return None
+    if isinstance(gpu_devices, str):
+        return {int(x) for x in gpu_devices.split(",") if x.strip() != ""}
+    return {int(x) for x in gpu_devices}
+
+
+def per_gpu_free_vram_bytes(gpu_devices: str | list[int] | None = "auto") -> dict[int, int]:
+    """{physical index -> free VRAM bytes} for the SELECTED nvidia GPUs, or
+    {} on a CPU-only box / no nvidia-smi. Index order here is what
+    backends/llamacpp.py's gpu_launch_args uses to build CUDA_VISIBLE_DEVICES
+    and --tensor-split."""
+    if not shutil.which("nvidia-smi"):
+        return {}
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if out.returncode != 0 or not out.stdout.strip():
+        return {}
+    selected = parse_gpu_devices(gpu_devices)
+    result: dict[int, int] = {}
+    for line in out.stdout.strip().splitlines():
+        try:
+            idx_s, mib_s = (p.strip() for p in line.split(","))
+            idx = int(idx_s)
+        except ValueError:
+            continue
+        if selected is not None and idx not in selected:
+            continue
+        result[idx] = int(float(mib_s)) * (1 << 20)
+    return result
+
+
+def total_vram_bytes(gpu_devices: str | list[int] | None = "auto") -> int:
+    """Total VRAM across the SELECTED nvidia GPUs (per-GPU on/off), or 0
+    (CPU-only box / no nvidia-smi, or a selection that excludes every card)."""
     if not shutil.which("nvidia-smi"):
         return 0
     try:
         out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            ["nvidia-smi", "--query-gpu=index,memory.total", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5)
-        if out.returncode == 0 and out.stdout.strip():
-            return sum(int(float(line)) * (1 << 20) for line in out.stdout.strip().splitlines())
-    except (OSError, subprocess.SubprocessError, ValueError):
-        pass
-    return 0
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    if out.returncode != 0 or not out.stdout.strip():
+        return 0
+    selected = parse_gpu_devices(gpu_devices)
+    total = 0
+    for line in out.stdout.strip().splitlines():
+        try:
+            idx_s, mib_s = (p.strip() for p in line.split(","))
+            idx = int(idx_s)
+        except ValueError:
+            continue
+        if selected is not None and idx not in selected:
+            continue
+        total += int(float(mib_s)) * (1 << 20)
+    return total
 
 
 def total_ram_bytes() -> int:
@@ -311,6 +365,14 @@ if __name__ == "__main__":
     assert ram_budget_bytes(10_000, 1) == min(10_000, 1 << 30)
     assert bound_ctx_size(4096, 0) == 4096, "no RAM budget known -> don't second-guess the request"
     assert bound_n_gpu_layers(999, 0, 100) == 999, "no VRAM budget known -> don't second-guess the request"
+
+    assert parse_gpu_devices("auto") is None
+    assert parse_gpu_devices(None) is None
+    assert parse_gpu_devices("0,1") == {0, 1}
+    assert parse_gpu_devices([1]) == {1}
+    # this box has no nvidia-smi -> both degrade to empty/zero, never crash
+    assert per_gpu_free_vram_bytes("auto") == {}
+    assert total_vram_bytes([0]) == 0
 
     always_on = ContributionController(ContributionPolicy(idle_only=False))
     assert always_on._tick() == ContributionState.ACTIVE

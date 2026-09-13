@@ -51,6 +51,16 @@ class CostModel:
     # default per-node decode tps if no benchmark present (pessimistic).
     default_decode_tps: float = 20.0
     default_prefill_tps: float = 400.0
+    # --- "more (close) nodes = more single-request speed" ---
+    # tensor-parallel across a low-latency pod scales a single request's decode with
+    # node count, minus interconnect overhead. NVLINK/PCIe/LAN only (is_lan_class).
+    tensor_parallel_efficiency: float = 0.85   # per added node; 2 nodes ~= 1.7x
+    # speculative decoding: a draft peer proposes tokens a strong peer verifies in
+    # one pass -> single-stream speedup, tolerant of moderate latency.
+    speculative_speedup: float = 1.6
+    speculative_max_rtt_ms: float = 50.0
+    # prefill can be sharded across close nodes -> lower TTFT with more nodes.
+    prefill_parallel_efficiency: float = 0.8
 
 
 @dataclass
@@ -149,6 +159,47 @@ class Scheduler:
             f"=> decode {decode_tps:.1f} tok/s."]
         return ttft, decode_tps, trace
 
+    def _mutually_lan_class(self, graph: TopologyGraph, chain: list[str]) -> bool:
+        """True only if EVERY pair in the chain is on a low-latency, high-bandwidth,
+        direct link — the precondition for a fast 'pod' that speeds a single request."""
+        for i in range(len(chain)):
+            for j in range(i + 1, len(chain)):
+                if not graph.link(chain[i], chain[j]).is_lan_class():
+                    return False
+        return True
+
+    def _predict_tensor(self, nodes: list[CapabilityRecord], graph: TopologyGraph,
+                        client_link: LinkMetrics, prompt_tokens: int
+                        ) -> tuple[float, float, list[str]]:
+        """Tensor-parallel across a low-latency pod: a SINGLE request's decode scales
+        with node count (each node computes a slice of every layer in lockstep over a
+        fast link). This is how more (close) nodes make one request FASTER."""
+        n = len(nodes)
+        base = min(self._node_decode_tps(x) for x in nodes)
+        # near-linear scaling on a fast interconnect, discounted by efficiency.
+        decode_tps = base * (1 + (n - 1) * self.cost.tensor_parallel_efficiency)
+        prefill = prompt_tokens / (sum(self._node_prefill_tps(x) for x in nodes)
+                                   * self.cost.prefill_parallel_efficiency)
+        ttft = prefill + (client_link.rtt_ms / 1000.0)
+        trace = [f"tensor-pod: {n} nodes on a LAN-class link act as one unit; "
+                 f"single-request decode {base:.0f}->{decode_tps:.0f} tok/s "
+                 f"(x{decode_tps/base:.2f}); prefill sharded. More close nodes = faster."]
+        return ttft, decode_tps, trace
+
+    def _predict_speculative(self, strong: CapabilityRecord, draft: CapabilityRecord,
+                            graph: TopologyGraph, client_link: LinkMetrics,
+                            prompt_tokens: int) -> tuple[float, float, list[str]]:
+        """Draft peer proposes tokens; strong peer verifies in one pass. Single-stream
+        decode speeds up even over a moderate-latency link to the draft peer."""
+        base = self._node_decode_tps(strong)
+        decode_tps = base * self.cost.speculative_speedup
+        prefill = prompt_tokens / self._node_prefill_tps(strong)
+        ttft = prefill + (client_link.rtt_ms / 1000.0)
+        trace = [f"speculative: draft {draft.node_id} + verifier {strong.node_id}; "
+                 f"single-stream decode {base:.0f}->{decode_tps:.0f} tok/s "
+                 f"(x{self.cost.speculative_speedup}). Extra peer accelerates one stream."]
+        return ttft, decode_tps, trace
+
     def _score(self, ttft: float, decode_tps: float, nodes: list[CapabilityRecord],
                graph: TopologyGraph, chain: list[str], queue_wait_s: float = 0.0) -> float:
         """Lower is better. Total user-visible time = queue wait + ttft + generation +
@@ -223,6 +274,34 @@ class Scheduler:
             score = self._score(ttft, tps, ranked, graph, chain)
             candidates.append(Candidate(Strategy.PIPELINE, chain, ttft, tps, score, tr))
 
+        # SPEED candidates: more (close/fast) nodes -> a single request runs FASTER.
+        # TENSOR pod: 2+ fitting replicas mutually on a LAN-class link (NVLINK/LAN/PCIe)
+        # -> tensor-parallel, single-request decode scales with node count.
+        for size in (3, 2):
+            pod = [n for n in replicas][:size]
+            if len(pod) == size and self._mutually_lan_class(graph, [n.node_id for n in pod]):
+                ttft, tps, tr = self._predict_tensor(
+                    pod, graph, graph.link(client_node_id, pod[0].node_id), prompt_tokens)
+                chain = [n.node_id for n in pod]
+                score = self._score(ttft, tps, pod, graph, chain)
+                candidates.append(Candidate(Strategy.TENSOR, chain, ttft, tps, score, tr))
+                break
+        # SPECULATIVE: a strong replica + any draft-capable peer within a tolerable RTT
+        # of it -> single-stream speedup (extra node accelerates one request).
+        if replicas:
+            strong = max(replicas, key=self._node_decode_tps)
+            drafts = [n for n in compatible if n.node_id != strong.node_id
+                      and graph.link(strong.node_id, n.node_id).rtt_ms
+                      <= self.cost.speculative_max_rtt_ms]
+            if drafts:
+                draft = drafts[0]
+                ttft, tps, tr = self._predict_speculative(
+                    strong, draft, graph, graph.link(client_node_id, strong.node_id),
+                    prompt_tokens)
+                score = self._score(ttft, tps, [strong], graph, [strong.node_id])
+                candidates.append(Candidate(Strategy.SPECULATIVE,
+                                            [strong.node_id, draft.node_id], ttft, tps, score, tr))
+
         if not candidates:
             raise ValueError(
                 "infeasible: no single node fits the model and no viable split found. "
@@ -264,9 +343,17 @@ class Scheduler:
         )
 
     def _assign(self, cand: Candidate, model: ModelManifest) -> list[ShardAssignment]:
+        backend = model.runtime.backends[0] if model.runtime.backends else ""
         if cand.strategy == Strategy.SINGLE:
             return [ShardAssignment(node_id=cand.peer_chain[0], role=Strategy.SINGLE,
-                                    backend=model.runtime.backends[0] if model.runtime.backends else "")]
+                                    backend=backend)]
+        if cand.strategy == Strategy.TENSOR:
+            # all pod members hold every layer, tensor-split (backend does the split)
+            return [ShardAssignment(node_id=nid, role=Strategy.TENSOR, backend=backend)
+                    for nid in cand.peer_chain]
+        if cand.strategy == Strategy.SPECULATIVE:
+            return [ShardAssignment(node_id=cand.peer_chain[0], role=Strategy.SINGLE, backend=backend),
+                    ShardAssignment(node_id=cand.peer_chain[1], role=Strategy.SPECULATIVE, backend=backend)]
         # pipeline: split 64 layers (or configured) across the chain evenly.
         layers = 64
         n = len(cand.peer_chain)

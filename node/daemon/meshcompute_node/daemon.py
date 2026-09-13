@@ -32,18 +32,17 @@ from meshcompute_protocol import (
 )
 from meshcompute_runtime.backends.base import BackendAdapter, ChatRequest
 from meshcompute_runtime.backends.lmstudio import OpenAICompatBackend
-from meshcompute_runtime.backends.llamacpp import LlamaCppBackend
+from meshcompute_runtime.backends.llamacpp import LlamaCppBackend, gpu_launch_args
 from meshcompute_runtime.runtime_installer import SMOKE_MODEL, detect_accel, ensure_llama_server, ensure_model
 
 from .capability import measure_capability, ram_free_bytes
 from .contribution import (
     ContributionController,
     bound_ctx_size,
-    bound_n_gpu_layers,
     cpu_thread_budget,
+    per_gpu_free_vram_bytes,
     ram_budget_bytes,
     total_ram_bytes,
-    total_vram_bytes,
     vram_budget_bytes,
 )
 from .rendezvous_client import RendezvousClient
@@ -91,8 +90,11 @@ async def _try_register(control_url: str, identity: NodeIdentity, pool_id: str) 
 
 
 async def _post_capability(control_url: str, identity: NodeIdentity, backend: BackendAdapter,
-                            policy: ContributionPolicy) -> CapabilityRecord:
-    record = await measure_capability(identity, backend, {"contribution_policy": policy.model_dump()})
+                            policy: ContributionPolicy, gpu_devices: str | list[int] | None = "auto",
+                            ) -> CapabilityRecord:
+    record = await measure_capability(
+        identity, backend,
+        {"contribution_policy": policy.model_dump(), "gpu_devices": gpu_devices})
     # Cap the ADVERTISED free_vram to the configured share, and attach the
     # full extended policy (measure_capability only knows the legacy 5
     # fields) — so the scheduler never over-places beyond what this
@@ -153,6 +155,8 @@ async def async_main(*, backend: str = "llamacpp", backend_url: str | None = Non
                       max_cpu_percent: int = 50, max_cpu: int | None = None,
                       max_ram_gb: int | None = None, max_gpu_percent: int = 90,
                       gpu_temperature_limit_c: int = 82, allow_public_pool: bool = True,
+                      gpu_devices: str | list[int] | None = "auto", split_mode: str = "layer",
+                      tensor_split: str | None = None,
                       smoke: bool = False, identity_path: str | None = None, ctx_size: int = 2048,
                       heartbeat_interval_s: float = HEARTBEAT_INTERVAL_S, **_ignored) -> None:
     pool_id = pool or pool_id
@@ -202,18 +206,29 @@ async def async_main(*, backend: str = "llamacpp", backend_url: str | None = Non
         thread_budget = cpu_thread_budget(policy.max_cpu_percent)
         ram_budget = ram_budget_bytes(total_ram_bytes(), policy.max_ram_gb)
         ctx_size = bound_ctx_size(ctx_size, ram_budget)
-        # TODO(phase-1.5): also offload on accel=="metal" once tested on an Apple box.
-        n_gpu_layers = 999 if accel == "cuda" else 0
-        if accel == "cuda":
-            vbudget = vram_budget_bytes(total_vram_bytes(), policy.max_vram_percent)
-            model_bytes = Path(model_path).stat().st_size
-            n_gpu_layers = bound_n_gpu_layers(n_gpu_layers, vbudget, model_bytes)
+
+        # Multi-GPU: enumerate the SELECTED cards (per-GPU on/off, "auto" =
+        # every detected GPU) and build the actual launch env/args — a pure,
+        # unit-tested helper (backends/llamacpp.py's gpu_launch_args). Degrades
+        # to the unchanged CPU path (env={}, args=[]) when nvidia-smi is
+        # absent, as on this box. TODO(phase-1.5): reconcile per-GPU VRAM
+        # budget capping (contribution.py's bound_n_gpu_layers) with the flat
+        # -ngl 999 gpu_launch_args uses today — untestable without real
+        # hardware either way; a real NVLINK pod is also TODO(phase-1.5).
+        free_vram_by_index = per_gpu_free_vram_bytes(gpu_devices)
+        selected_gpus = [{"index": i, "free_vram_bytes": free_vram_by_index[i]}
+                          for i in sorted(free_vram_by_index)]
+        gpu_env, gpu_args = gpu_launch_args(selected_gpus, split_mode=split_mode,
+                                             tensor_split=tensor_split)
+        n_gpu_layers = 0  # -ngl travels via gpu_args (extra_args) when GPUs are selected
         print(f"[mesh] resource budget: threads={thread_budget} ctx_size={ctx_size} "
-              f"n_gpu_layers={n_gpu_layers}")
+              f"gpus={[g['index'] for g in selected_gpus] or 'none (cpu)'} "
+              f"launch_env={gpu_env} launch_args={gpu_args}")
 
         llama_backend = LlamaCppBackend(server_bin, model_path, host="127.0.0.1", port=port,
                                          ctx_size=ctx_size, n_gpu_layers=n_gpu_layers,
-                                         extra_args=["--threads", str(thread_budget)])
+                                         extra_args=["--threads", str(thread_budget), *gpu_args],
+                                         extra_env=gpu_env)
         await llama_backend.start()
         backend_adapter = llama_backend
         endpoint = f"{llama_backend.base_url}/v1"
@@ -252,7 +267,7 @@ async def async_main(*, backend: str = "llamacpp", backend_url: str | None = Non
             # bootstrap and always happen once reachable; the RECURRING
             # heartbeat is what's gated on the live ACTIVE/PAUSED state below
             # (that's the actual "am I available right now" network signal).
-            record = await _post_capability(control_url, identity, backend_adapter, policy)
+            record = await _post_capability(control_url, identity, backend_adapter, policy, gpu_devices)
             print(f"[mesh] posted signed capability: decode "
                   f"{record.benchmark.decode_tokens_per_sec} tok/s, backends={record.backends}")
             await _announce_rendezvous(control_url, identity, transport.local_quic_port)
